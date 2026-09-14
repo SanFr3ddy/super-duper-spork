@@ -1,0 +1,361 @@
+/**
+ * Tipos compartidos entre servidor (Express) y cliente (Vite).
+ *
+ * Convenciones:
+ *  - Fechas de calendario: string 'YYYY-MM-DD' (columna DATE).
+ *  - Marcas de tiempo: string ISO 8601 (columna TIMESTAMPTZ).
+ *  - Montos: number (NUMERIC(14,2) en PostgreSQL, convertido a número en server/db.ts).
+ *  - Todos los endpoints viven bajo /api y responden JSON.
+ *  - Errores: { error: string, details?: unknown } con el status HTTP adecuado (400, 401, 404, 500).
+ *
+ * REGLAS DE FLUJO DE EFECTIVO (las usan /api/dashboard y /api/budgets):
+ *  - Ingresos  = transactions.type = 'income'
+ *  - Gastos    = transactions.type = 'expense' (incluye compras con tarjeta, contadas en la fecha de la compra)
+ *  - Pagos de tarjeta (card_payments) NO cuentan como gasto (evita duplicar); solo reducen la deuda de la tarjeta.
+ *  - Pagos de préstamo (loan_payments) SÍ cuentan como salida ("Préstamos"), separada de Gastos.
+ *  - Aportes a metas (goal_contributions) cuentan como "Ahorro".
+ *  - Disponible del mes = Ingresos - Gastos - Préstamos - Ahorro
+ *  - Tasa de ahorro = Ahorro / Ingresos (0 si no hay ingresos)
+ */
+
+export type TxType = 'income' | 'expense';
+
+// ---------------------------------------------------------------------------
+// Configuración pública: GET /api/config  (no requiere sesión)
+// ---------------------------------------------------------------------------
+export interface AppConfig {
+  currency: string; // p. ej. 'MXN'
+  locale: string; // p. ej. 'es-MX'
+}
+
+// ---------------------------------------------------------------------------
+// Autenticación
+//  GET  /api/auth/status  -> AuthStatus
+//  POST /api/auth/login   { password: string } -> { ok: true }
+//  POST /api/auth/logout  -> { ok: true }
+// ---------------------------------------------------------------------------
+export interface AuthStatus {
+  required: boolean;
+  authenticated: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Categorías
+//  GET    /api/categories?type=income|expense  -> Category[]
+//  POST   /api/categories        CategoryInput -> Category
+//  PUT    /api/categories/:id    Partial<CategoryInput> -> Category
+//  DELETE /api/categories/:id    -> { ok: true }
+// ---------------------------------------------------------------------------
+export interface Category {
+  id: number;
+  name: string;
+  type: TxType;
+  color: string; // hex '#rrggbb'
+  icon: string | null; // emoji opcional
+  created_at: string;
+}
+export interface CategoryInput {
+  name: string;
+  type: TxType;
+  color?: string;
+  icon?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Movimientos (ingresos y gastos)
+//  GET    /api/transactions?year=2026&month=9&type=&category_id=&credit_card_id=&q=
+//           -> TransactionsResponse
+//           (year y month opcionales; si faltan se usa el mes actual. month=0 => todo el año)
+//  POST   /api/transactions       TransactionInput -> Transaction
+//  PUT    /api/transactions/:id   Partial<TransactionInput> -> Transaction
+//  DELETE /api/transactions/:id   -> { ok: true }
+// ---------------------------------------------------------------------------
+export interface Transaction {
+  id: number;
+  type: TxType;
+  amount: number;
+  category_id: number | null;
+  category_name: string | null;
+  category_color: string | null;
+  category_icon: string | null;
+  description: string;
+  date: string;
+  credit_card_id: number | null;
+  card_name: string | null;
+  created_at: string;
+}
+export interface TransactionInput {
+  type: TxType;
+  amount: number;
+  category_id?: number | null;
+  description?: string;
+  date: string;
+  credit_card_id?: number | null; // solo para gastos pagados con tarjeta de crédito
+}
+export interface TransactionsResponse {
+  items: Transaction[];
+  totals: { income: number; expenses: number; net: number };
+}
+
+// ---------------------------------------------------------------------------
+// Tarjetas de crédito
+//  GET    /api/cards                -> CreditCard[] (con campos calculados)
+//  POST   /api/cards                CreditCardInput -> CreditCard
+//  PUT    /api/cards/:id            Partial<CreditCardInput> -> CreditCard
+//  DELETE /api/cards/:id            -> { ok: true }
+//  GET    /api/cards/:id/payments   -> CardPayment[]
+//  POST   /api/cards/:id/payments   CardPaymentInput -> CardPayment
+//  DELETE /api/cards/:id/payments/:paymentId -> { ok: true }
+//  GET    /api/cards/:id/charges?limit=20 -> Transaction[] (compras hechas con la tarjeta)
+// ---------------------------------------------------------------------------
+export interface CreditCard {
+  id: number;
+  name: string;
+  credit_limit: number;
+  cutoff_day: number; // día de corte (1-31)
+  payment_day: number; // día límite de pago (1-31)
+  color: string;
+  created_at: string;
+  // calculados
+  charged_total: number; // suma de gastos con esta tarjeta (histórico)
+  paid_total: number; // suma de pagos a la tarjeta (histórico)
+  balance: number; // charged_total - paid_total (deuda actual, mínimo 0)
+  utilization: number; // balance / credit_limit (0..1+), 0 si no hay límite
+  charged_this_month: number; // gastos con la tarjeta en el mes actual
+  paid_this_month: number; // pagos a la tarjeta en el mes actual
+  last_payment_date: string | null;
+  next_cutoff_date: string; // próxima fecha de corte 'YYYY-MM-DD'
+  next_payment_date: string; // próxima fecha límite de pago 'YYYY-MM-DD'
+}
+export interface CreditCardInput {
+  name: string;
+  credit_limit: number;
+  cutoff_day: number;
+  payment_day: number;
+  color?: string;
+}
+export interface CardPayment {
+  id: number;
+  credit_card_id: number;
+  amount: number;
+  date: string;
+  note: string;
+  created_at: string;
+}
+export interface CardPaymentInput {
+  amount: number;
+  date: string;
+  note?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Préstamos
+//  GET    /api/loans                 -> Loan[] (con calculados)
+//  POST   /api/loans                 LoanInput -> Loan
+//  PUT    /api/loans/:id             Partial<LoanInput> -> Loan
+//  DELETE /api/loans/:id             -> { ok: true }
+//  GET    /api/loans/:id/payments    -> LoanPayment[]
+//  POST   /api/loans/:id/payments    LoanPaymentInput -> LoanPayment
+//  DELETE /api/loans/:id/payments/:paymentId -> { ok: true }
+//  GET    /api/loans/:id/schedule    -> LoanScheduleRow[] (tabla de amortización teórica)
+// ---------------------------------------------------------------------------
+export interface Loan {
+  id: number;
+  name: string;
+  principal: number; // monto original
+  annual_rate: number; // tasa anual en porcentaje, p. ej. 18.5
+  monthly_payment: number; // pago mensual acordado
+  start_date: string;
+  term_months: number;
+  created_at: string;
+  // calculados
+  paid_total: number;
+  payments_count: number;
+  remaining: number; // saldo actual CON intereses mensuales hasta hoy, menos pagos (mínimo 0). Ver server/loanMath.ts
+  progress: number; // capital amortizado / principal (0..1)
+  interest_paid: number; // intereses generados hasta hoy
+  last_payment_date: string | null;
+  end_date: string; // start_date + term_months
+  estimated_months_left: number | null; // meses para liquidar el saldo con el pago mensual; null si el pago es 0 o no cubre intereses
+  total_interest_estimate: number; // interés total estimado según la tabla de amortización
+}
+export interface LoanInput {
+  name: string;
+  principal: number;
+  annual_rate: number;
+  monthly_payment: number;
+  start_date: string;
+  term_months: number;
+}
+export interface LoanPayment {
+  id: number;
+  loan_id: number;
+  amount: number;
+  date: string;
+  note: string;
+  created_at: string;
+}
+export interface LoanPaymentInput {
+  amount: number;
+  date: string;
+  note?: string;
+}
+export interface LoanScheduleRow {
+  period: number; // 1..term_months
+  date: string;
+  payment: number;
+  interest: number;
+  principal: number;
+  balance: number; // saldo después del pago
+}
+
+// ---------------------------------------------------------------------------
+// Metas de ahorro
+//  GET    /api/goals                       -> SavingsGoal[]
+//  POST   /api/goals                       SavingsGoalInput -> SavingsGoal
+//  PUT    /api/goals/:id                   Partial<SavingsGoalInput> -> SavingsGoal
+//  DELETE /api/goals/:id                   -> { ok: true }
+//  GET    /api/goals/:id/contributions     -> GoalContribution[]
+//  POST   /api/goals/:id/contributions     GoalContributionInput -> GoalContribution
+//  DELETE /api/goals/:id/contributions/:contributionId -> { ok: true }
+// ---------------------------------------------------------------------------
+export interface SavingsGoal {
+  id: number;
+  name: string;
+  target_amount: number;
+  deadline: string | null;
+  color: string;
+  icon: string | null;
+  created_at: string;
+  // calculados
+  saved_total: number;
+  remaining: number; // target - saved (mínimo 0)
+  progress: number; // saved / target (0..1+)
+  contributions_count: number;
+  monthly_needed: number | null; // remaining / meses hasta deadline, null si no hay deadline o ya pasó
+  completed: boolean;
+}
+export interface SavingsGoalInput {
+  name: string;
+  target_amount: number;
+  deadline?: string | null;
+  color?: string;
+  icon?: string | null;
+}
+export interface GoalContribution {
+  id: number;
+  goal_id: number;
+  amount: number; // puede ser negativo para retiros
+  date: string;
+  note: string;
+  created_at: string;
+}
+export interface GoalContributionInput {
+  amount: number;
+  date: string;
+  note?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Presupuestos mensuales por categoría de gasto
+//  GET    /api/budgets?year=2026&month=9  -> BudgetsResponse
+//  PUT    /api/budgets                    BudgetInput -> Budget (upsert por categoría+año+mes)
+//  DELETE /api/budgets/:id                -> { ok: true }
+//  POST   /api/budgets/copy               { from_year, from_month, to_year, to_month } -> { copied: number }
+// ---------------------------------------------------------------------------
+export interface Budget {
+  id: number;
+  category_id: number;
+  category_name: string;
+  category_color: string;
+  category_icon: string | null;
+  year: number;
+  month: number;
+  amount: number; // límite
+  spent: number; // gastado en ese mes en esa categoría
+  remaining: number; // amount - spent (puede ser negativo)
+  ratio: number; // spent / amount (0..1+), 0 si amount = 0
+}
+export interface BudgetInput {
+  category_id: number;
+  year: number;
+  month: number;
+  amount: number;
+}
+export interface BudgetsResponse {
+  year: number;
+  month: number;
+  items: Budget[];
+  totals: { budgeted: number; spent: number; remaining: number };
+  /** Categorías de gasto sin presupuesto ese mes, con lo gastado, para sugerir agregar */
+  unbudgeted: {
+    category_id: number;
+    category_name: string;
+    category_color: string;
+    category_icon: string | null;
+    spent: number;
+  }[];
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard
+//  GET /api/dashboard?year=2026  -> DashboardYear
+// ---------------------------------------------------------------------------
+export interface MonthSummary {
+  month: number; // 1..12
+  income: number;
+  expenses: number;
+  card_payments: number; // informativo, no se resta
+  loan_payments: number;
+  savings: number;
+  net: number; // income - expenses - loan_payments - savings
+  savings_rate: number; // savings / income (0 si income = 0)
+}
+export interface CategoryTotal {
+  category_id: number | null;
+  name: string;
+  color: string;
+  icon: string | null;
+  total: number;
+  share: number; // total / suma de la lista (0..1)
+}
+export interface DashboardYear {
+  year: number;
+  months: MonthSummary[]; // siempre 12 elementos, enero..diciembre
+  totals: {
+    income: number;
+    expenses: number;
+    loan_payments: number;
+    savings: number;
+    card_payments: number;
+    net: number;
+    savings_rate: number;
+    avg_monthly_expenses: number; // promedio sobre meses con actividad
+    best_month: number | null; // mes con mayor net (solo meses con actividad)
+    worst_month: number | null; // mes con menor net (solo meses con actividad)
+  };
+  expenses_by_category: CategoryTotal[]; // del año, ordenado desc
+  income_by_category: CategoryTotal[]; // del año, ordenado desc
+  current_month: {
+    year: number;
+    month: number;
+    income: number;
+    expenses: number;
+    savings: number;
+    loan_payments: number;
+    net: number;
+    budget: { budgeted: number; spent: number } | null; // null si no hay presupuestos ese mes
+    expenses_by_category: CategoryTotal[]; // del mes actual
+  };
+  cards: {
+    count: number;
+    total_debt: number;
+    total_limit: number;
+    utilization: number;
+    next_payment: { name: string; date: string; balance: number } | null;
+  };
+  loans: { count: number; total_remaining: number; total_principal: number; monthly_commitment: number };
+  goals: { count: number; total_saved: number; total_target: number; progress: number };
+  recent: Transaction[]; // últimos 8 movimientos
+  available_years: number[]; // años con datos, desc (incluye el actual)
+}

@@ -1,0 +1,26 @@
+# Blueprint de Render. También puedes crear el servicio a mano:
+#   Build command: npm ci --include=dev && npm run build
+#   Start command: npm start
+services:
+  - type: web
+    name: finanzas-habitos
+    runtime: node
+    plan: free
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: CURRENCY
+        value: MXN
+      - key: LOCALE
+        value: es-MX
+      - key: TZ
+        value: America/Mexico_City
