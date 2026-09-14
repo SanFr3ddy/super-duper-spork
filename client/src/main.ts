@@ -14,6 +14,7 @@ import * as loans from './views/loans';
 import * as goals from './views/goals';
 import * as budgets from './views/budgets';
 import * as categories from './views/categories';
+import * as accounts from './views/accounts';
 
 interface View {
   render: (root: HTMLElement) => Promise<void> | void;
@@ -26,15 +27,18 @@ interface Route {
   icon: string;
   view: View;
   nav: boolean;
+  /** Etiqueta corta para la barra inferior en móvil. */
+  short?: string;
 }
 
 export const ROUTES: Route[] = [
   { path: 'resumen', title: 'Resumen', subtitle: 'Tu año de un vistazo', icon: '📊', view: dashboard, nav: true },
-  { path: 'movimientos', title: 'Movimientos', subtitle: 'Ingresos y gastos', icon: '🧾', view: transactions, nav: true },
-  { path: 'tarjetas', title: 'Tarjetas', subtitle: 'Tarjetas de crédito y pagos', icon: '💳', view: cards, nav: true },
+  { path: 'dinero', title: 'Mi dinero', subtitle: 'Cuánto tienes y en qué banco está', icon: '💰', view: accounts, nav: true, short: 'Dinero' },
+  { path: 'movimientos', title: 'Movimientos', subtitle: 'Ingresos y gastos', icon: '🧾', view: transactions, nav: true, short: 'Movim.' },
+  { path: 'tarjetas', title: 'Tarjetas', subtitle: 'Tarjetas de crédito, pagos y compras a meses', icon: '💳', view: cards, nav: true },
   { path: 'prestamos', title: 'Préstamos', subtitle: 'Deudas y su avance', icon: '🏦', view: loans, nav: true },
-  { path: 'ahorros', title: 'Ahorros', subtitle: 'Metas y aportes', icon: '🎯', view: goals, nav: true },
-  { path: 'presupuestos', title: 'Presupuestos', subtitle: 'Límites mensuales por categoría', icon: '📐', view: budgets, nav: true },
+  { path: 'ahorros', title: 'Metas', subtitle: 'Metas de ahorro y aportes', icon: '🎯', view: goals, nav: true },
+  { path: 'presupuestos', title: 'Presupuestos', subtitle: 'Límites mensuales por categoría', icon: '📐', view: budgets, nav: true, short: 'Presup.' },
   { path: 'categorias', title: 'Categorías', subtitle: 'Personaliza tus categorías', icon: '🏷️', view: categories, nav: false },
 ];
 
@@ -61,7 +65,7 @@ function renderLayout(): void {
         </div>
         <nav class="nav" aria-label="Secciones">
           ${ROUTES.filter((r) => r.nav)
-            .map((r) => `<a href="#/${r.path}" data-route="${r.path}"><span class="ico">${r.icon}</span><span>${esc(r.title)}</span></a>`)
+            .map((r) => `<a href="#/${r.path}" data-route="${r.path}" title="${esc(r.title)}"><span class="ico">${r.icon}</span><span class="label-full">${esc(r.title)}</span><span class="label-short">${esc(r.short ?? r.title)}</span></a>`)
             .join('')}
         </nav>
         <div class="sidebar-foot">

@@ -93,6 +93,52 @@ CREATE TABLE IF NOT EXISTS goal_contributions (
 CREATE INDEX IF NOT EXISTS idx_goal_contributions_goal ON goal_contributions(goal_id);
 CREATE INDEX IF NOT EXISTS idx_goal_contributions_date ON goal_contributions(date);
 
+-- Mi dinero: cuentas por banco (independientes de las metas de ahorro)
+CREATE TABLE IF NOT EXISTS accounts (
+  id               SERIAL PRIMARY KEY,
+  name             TEXT NOT NULL,
+  bank             TEXT NOT NULL DEFAULT '',
+  kind             TEXT NOT NULL CHECK (kind IN ('disponible', 'ahorro', 'inversion', 'efectivo')),
+  opening_balance  NUMERIC(14,2) NOT NULL DEFAULT 0,
+  opening_date     DATE NOT NULL DEFAULT CURRENT_DATE,
+  color            TEXT NOT NULL DEFAULT '#e5202e',
+  archived         BOOLEAN NOT NULL DEFAULT false,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE transactions  ADD COLUMN IF NOT EXISTS account_id INT REFERENCES accounts(id) ON DELETE SET NULL;
+ALTER TABLE card_payments ADD COLUMN IF NOT EXISTS account_id INT REFERENCES accounts(id) ON DELETE SET NULL;
+ALTER TABLE loan_payments ADD COLUMN IF NOT EXISTS account_id INT REFERENCES accounts(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_transactions_account ON transactions(account_id);
+
+-- Compras a meses (solo gastos con tarjeta): 1 = una sola exhibición
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS installments INT NOT NULL DEFAULT 1 CHECK (installments BETWEEN 1 AND 48);
+CREATE INDEX IF NOT EXISTS idx_card_payments_account ON card_payments(account_id);
+CREATE INDEX IF NOT EXISTS idx_loan_payments_account ON loan_payments(account_id);
+
+CREATE TABLE IF NOT EXISTS transfers (
+  id               SERIAL PRIMARY KEY,
+  from_account_id  INT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  to_account_id    INT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  amount           NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+  date             DATE NOT NULL DEFAULT CURRENT_DATE,
+  note             TEXT NOT NULL DEFAULT '',
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (from_account_id <> to_account_id)
+);
+CREATE INDEX IF NOT EXISTS idx_transfers_from ON transfers(from_account_id);
+CREATE INDEX IF NOT EXISTS idx_transfers_to ON transfers(to_account_id);
+
+CREATE TABLE IF NOT EXISTS balance_adjustments (
+  id          SERIAL PRIMARY KEY,
+  account_id  INT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  amount      NUMERIC(14,2) NOT NULL CHECK (amount <> 0),
+  date        DATE NOT NULL DEFAULT CURRENT_DATE,
+  note        TEXT NOT NULL DEFAULT '',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_balance_adjustments_account ON balance_adjustments(account_id);
+
 CREATE TABLE IF NOT EXISTS sessions (
   sid         TEXT PRIMARY KEY,
   expires_at  TIMESTAMPTZ NOT NULL,

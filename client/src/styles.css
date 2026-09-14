@@ -269,6 +269,9 @@ td.amount,
 .mobile-links {
   display: none;
 }
+.nav .label-short {
+  display: none;
+}
 
 /* ---------- Tarjetas y rejillas ---------- */
 .card {
@@ -1021,6 +1024,16 @@ td.actions {
   }
   .nav .ico {
     font-size: 1.15rem;
+  }
+  .nav .label-full {
+    display: none;
+  }
+  .nav .label-short {
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
   }
   .main {
     padding: 18px 16px calc(var(--nav-h) + 28px);

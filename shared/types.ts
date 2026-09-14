@@ -14,8 +14,26 @@
  *  - Pagos de tarjeta (card_payments) NO cuentan como gasto (evita duplicar); solo reducen la deuda de la tarjeta.
  *  - Pagos de préstamo (loan_payments) SÍ cuentan como salida ("Préstamos"), separada de Gastos.
  *  - Aportes a metas (goal_contributions) cuentan como "Ahorro".
- *  - Disponible del mes = Ingresos - Gastos - Préstamos - Ahorro
+ *  - Flujo neto del mes = Ingresos - Gastos - Préstamos - Ahorro   (antes llamado "Disponible")
  *  - Tasa de ahorro = Ahorro / Ingresos (0 si no hay ingresos)
+ *
+ * CUENTAS ("Mi dinero": dinero real y en qué banco está). Son independientes de las metas de ahorro.
+ *  Saldo de una cuenta a una fecha D = opening_balance
+ *    + ingresos con account_id                       (transactions.type='income')
+ *    - gastos con account_id y SIN tarjeta de crédito (una compra con tarjeta no toca la cuenta)
+ *    - pagos de tarjeta con account_id (card_payments) - pagos de préstamo con account_id (loan_payments)
+ *    + transferencias recibidas - transferencias enviadas + ajustes de saldo (signo incluido)
+ *  contando solo eventos con opening_date <= fecha <= D. El "saldo actual" usa D = hoy (TZ del servidor).
+ *  Implementación única en server/accountsData.ts; no dupliques la fórmula.
+ *
+ * COMPRAS A MESES (diferidas / meses sin intereses), solo gastos con tarjeta de crédito:
+ *  - transactions.installments = número de mensualidades (1 = una sola exhibición).
+ *  - La compra sigue contando como GASTO COMPLETO en su fecha (flujo, presupuestos y resumen no cambian).
+ *  - Mensualidad = round2(total / n); la última ajusta centavos (total - mensualidad * (n - 1)).
+ *  - La mensualidad k (1..n) corresponde al mes (mes de compra + k): la primera se paga el mes siguiente a la compra.
+ *  - Deuda diferida pendiente de una tarjeta = suma de mensualidades de meses POSTERIORES al mes de referencia.
+ *  - Pago para no generar intereses este mes = max(0, deuda de la tarjeta - deuda diferida pendiente).
+ *  Implementación única en server/installments.ts.
  */
 
 export type TxType = 'income' | 'expense';
@@ -63,7 +81,7 @@ export interface CategoryInput {
 
 // ---------------------------------------------------------------------------
 // Movimientos (ingresos y gastos)
-//  GET    /api/transactions?year=2026&month=9&type=&category_id=&credit_card_id=&q=
+//  GET    /api/transactions?year=2026&month=9&type=&category_id=&credit_card_id=&account_id=&q=
 //           -> TransactionsResponse
 //           (year y month opcionales; si faltan se usa el mes actual. month=0 => todo el año)
 //  POST   /api/transactions       TransactionInput -> Transaction
@@ -82,6 +100,10 @@ export interface Transaction {
   date: string;
   credit_card_id: number | null;
   card_name: string | null;
+  account_id: number | null; // cuenta de donde salió (gasto) o a donde entró (ingreso)
+  account_name: string | null;
+  account_bank: string | null;
+  installments: number; // 1 = una sola exhibición; >1 = compra a meses con tarjeta
   created_at: string;
 }
 export interface TransactionInput {
@@ -91,6 +113,8 @@ export interface TransactionInput {
   description?: string;
   date: string;
   credit_card_id?: number | null; // solo para gastos pagados con tarjeta de crédito
+  account_id?: number | null; // cuenta; el servidor la fuerza a null si hay credit_card_id
+  installments?: number; // 1..48; el servidor lo fuerza a 1 si no es gasto con tarjeta
 }
 export interface TransactionsResponse {
   items: Transaction[];
@@ -107,6 +131,7 @@ export interface TransactionsResponse {
 //  POST   /api/cards/:id/payments   CardPaymentInput -> CardPayment
 //  DELETE /api/cards/:id/payments/:paymentId -> { ok: true }
 //  GET    /api/cards/:id/charges?limit=20 -> Transaction[] (compras hechas con la tarjeta)
+//  GET    /api/cards/installments?year=2026&month=9 -> InstallmentsResponse (compras a meses; por defecto el mes actual)
 // ---------------------------------------------------------------------------
 export interface CreditCard {
   id: number;
@@ -126,6 +151,42 @@ export interface CreditCard {
   last_payment_date: string | null;
   next_cutoff_date: string; // próxima fecha de corte 'YYYY-MM-DD'
   next_payment_date: string; // próxima fecha límite de pago 'YYYY-MM-DD'
+  // compras a meses (mes de referencia = mes actual)
+  active_plans: number; // compras a meses con mensualidades pendientes o del mes actual
+  installments_due_this_month: number; // suma de mensualidades que tocan este mes
+  deferred_remaining: number; // mensualidades de meses posteriores (aún no exigibles)
+  pay_this_month: number; // pago para no generar intereses = max(0, balance - deferred_remaining)
+}
+
+export type InstallmentStatus = 'pendiente' | 'activa' | 'terminada';
+
+export interface InstallmentPlan {
+  transaction_id: number;
+  credit_card_id: number;
+  card_name: string;
+  description: string; // descripción o, si está vacía, nombre de la categoría
+  category_icon: string | null;
+  purchase_date: string;
+  total: number;
+  installments: number;
+  monthly_amount: number; // mensualidad normal (la última puede diferir por centavos)
+  first_month: string; // 'YYYY-MM' de la mensualidad 1
+  last_month: string; // 'YYYY-MM' de la última mensualidad
+  current_number: number; // mensualidad que toca en el mes de referencia (0 = aún no empieza; > installments = terminada)
+  status: InstallmentStatus;
+  due_this_month: number; // monto de la mensualidad del mes de referencia (0 si no toca)
+  billed_amount: number; // suma de mensualidades hasta el mes de referencia (incluido)
+  remaining_amount: number; // total - billed_amount
+  remaining_installments: number; // mensualidades después del mes de referencia
+}
+
+export interface InstallmentsResponse {
+  year: number;
+  month: number;
+  items: InstallmentPlan[]; // activas y pendientes primero (por fecha de fin), luego terminadas (máx. 12 más recientes)
+  totals: { due_this_month: number; deferred_remaining: number; active_plans: number };
+  by_card: { credit_card_id: number; card_name: string; due_this_month: number; deferred_remaining: number; active_plans: number }[];
+  schedule: { month: string; amount: number }[]; // próximos 12 meses desde el mes de referencia (incluido): 'YYYY-MM' y total de mensualidades
 }
 export interface CreditCardInput {
   name: string;
@@ -140,12 +201,15 @@ export interface CardPayment {
   amount: number;
   date: string;
   note: string;
+  account_id: number | null; // cuenta con la que se pagó
+  account_name: string | null;
   created_at: string;
 }
 export interface CardPaymentInput {
   amount: number;
   date: string;
   note?: string;
+  account_id?: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -193,12 +257,15 @@ export interface LoanPayment {
   amount: number;
   date: string;
   note: string;
+  account_id: number | null; // cuenta con la que se pagó
+  account_name: string | null;
   created_at: string;
 }
 export interface LoanPaymentInput {
   amount: number;
   date: string;
   note?: string;
+  account_id?: number | null;
 }
 export interface LoanScheduleRow {
   period: number; // 1..term_months
@@ -353,9 +420,146 @@ export interface DashboardYear {
     total_limit: number;
     utilization: number;
     next_payment: { name: string; date: string; balance: number } | null;
+    installments_due_this_month: number; // mensualidades de compras a meses que tocan este mes (todas las tarjetas)
+    deferred_remaining: number; // deuda diferida pendiente (meses posteriores)
+    pay_this_month: number; // suma de pay_this_month de las tarjetas
   };
   loans: { count: number; total_remaining: number; total_principal: number; monthly_commitment: number };
   goals: { count: number; total_saved: number; total_target: number; progress: number };
+  /** Dinero real en cuentas (no archivadas), saldo a hoy. */
+  money: {
+    total: number;
+    disponible: number; // kind disponible + efectivo
+    guardado: number; // kind ahorro + inversion
+    accounts_count: number;
+    by_bank: BankTotal[]; // top 5 por total desc
+  };
   recent: Transaction[]; // últimos 8 movimientos
   available_years: number[]; // años con datos, desc (incluye el actual)
+}
+
+// ---------------------------------------------------------------------------
+// Mi dinero: cuentas por banco, transferencias y ajustes
+//  GET    /api/accounts?year=2026            -> AccountsOverview
+//  GET    /api/accounts/list                 -> Account[] (todas, para selects; archivadas con archived=true)
+//  POST   /api/accounts                      AccountInput -> Account
+//  PUT    /api/accounts/:id                  Partial<AccountInput> -> Account
+//  DELETE /api/accounts/:id                  -> { ok: true }
+//           (movimientos/pagos quedan con account_id NULL; sus transferencias y ajustes se borran)
+//  GET    /api/accounts/:id/movements        -> AccountMovement[] (más reciente primero, con saldo acumulado)
+//  POST   /api/accounts/:id/adjust           AccountAdjustInput -> Account (crea un ajuste = saldo real - saldo calculado)
+//  DELETE /api/accounts/:id/adjustments/:adjustmentId -> { ok: true }
+//  POST   /api/accounts/transfers            TransferInput -> Transfer
+//  DELETE /api/accounts/transfers/:id        -> { ok: true }
+// ---------------------------------------------------------------------------
+export type AccountKind = 'disponible' | 'ahorro' | 'inversion' | 'efectivo';
+
+export const ACCOUNT_KIND_LABELS: Record<AccountKind, string> = {
+  disponible: 'Disponible (débito / nómina)',
+  ahorro: 'Ahorro',
+  inversion: 'Inversión',
+  efectivo: 'Efectivo',
+};
+
+export interface Account {
+  id: number;
+  name: string; // p. ej. "Nómina", "Cuenta de ahorro"
+  bank: string; // p. ej. "BBVA", "Nu"; '' si no aplica
+  kind: AccountKind;
+  opening_balance: number; // saldo al inicio de opening_date
+  opening_date: string;
+  color: string;
+  archived: boolean;
+  created_at: string;
+  // calculados (a hoy)
+  balance: number;
+  inflow_this_month: number; // entradas del mes actual (ingresos, transferencias recibidas, ajustes +)
+  outflow_this_month: number; // salidas del mes actual (positivo)
+  last_movement_date: string | null;
+  movements_count: number;
+}
+export interface AccountInput {
+  name: string;
+  bank?: string;
+  kind: AccountKind;
+  opening_balance: number; // puede ser negativo (sobregiro)
+  opening_date?: string; // por defecto hoy
+  color?: string;
+  archived?: boolean;
+}
+export interface AccountAdjustInput {
+  balance: number; // saldo real que marca el banco
+  date?: string; // por defecto hoy
+  note?: string;
+}
+
+export type AccountMovementSource =
+  | 'opening'
+  | 'income'
+  | 'expense'
+  | 'card_payment'
+  | 'loan_payment'
+  | 'transfer_in'
+  | 'transfer_out'
+  | 'adjustment';
+
+export interface AccountMovement {
+  key: string; // único: 'opening', 'tx-12', 'cp-3', 'lp-5', 'tr-7', 'adj-2'
+  source: AccountMovementSource;
+  ref_id: number | null; // id del registro de origen (transacción, pago, transferencia o ajuste)
+  date: string;
+  description: string;
+  amount: number; // con signo: + entra, - sale
+  running_balance: number; // saldo después de este movimiento
+  future: boolean; // fecha posterior a hoy (no cuenta en el saldo actual)
+}
+
+export interface Transfer {
+  id: number;
+  from_account_id: number;
+  to_account_id: number;
+  amount: number;
+  date: string;
+  note: string;
+  created_at: string;
+}
+export interface TransferInput {
+  from_account_id: number;
+  to_account_id: number;
+  amount: number;
+  date: string;
+  note?: string;
+}
+
+export interface BankTotal {
+  bank: string; // nombre mostrado; 'Efectivo' para cuentas de efectivo sin banco, 'Sin banco' si está vacío
+  total: number;
+  share: number; // max(0,total) / suma de max(0,total) (0..1)
+  accounts: number;
+  disponible: number; // disponible + efectivo
+  guardado: number; // ahorro + inversion
+}
+
+export interface AccountsMonth {
+  month: number; // 1..12
+  total: number | null; // saldo al cierre del mes (o a hoy en el mes actual); null = futuro o sin cuentas abiertas
+  disponible: number | null;
+  guardado: number | null;
+}
+
+export interface AccountsOverview {
+  year: number;
+  items: Account[]; // todas; activas primero, luego archivadas
+  totals: {
+    total: number;
+    disponible: number; // disponible + efectivo
+    guardado: number; // ahorro + inversion
+    ahorro: number;
+    inversion: number;
+    efectivo: number;
+    accounts: number; // cuentas activas
+  }; // solo cuentas no archivadas
+  by_bank: BankTotal[]; // solo no archivadas, total desc
+  monthly: AccountsMonth[]; // siempre 12
+  available_years: number[]; // desc, incluye el actual
 }

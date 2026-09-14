@@ -15,6 +15,7 @@ import { loansRouter } from './routes/loans.js';
 import { goalsRouter } from './routes/goals.js';
 import { budgetsRouter } from './routes/budgets.js';
 import { dashboardRouter } from './routes/dashboard.js';
+import { accountsRouter } from './routes/accounts.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 3000;
@@ -58,6 +59,7 @@ app.use('/api/loans', loansRouter);
 app.use('/api/goals', goalsRouter);
 app.use('/api/budgets', budgetsRouter);
 app.use('/api/dashboard', dashboardRouter);
+app.use('/api/accounts', accountsRouter);
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Ruta no encontrada' }));
 app.use(errorHandler);
 
