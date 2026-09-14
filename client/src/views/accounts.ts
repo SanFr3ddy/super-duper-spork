@@ -538,7 +538,7 @@ function bankRowHtml(b: Bank): string {
     </div>
     ${capHtml}
     <div class="v-money-bk-foot">
-      <span>${info.join(' · ') || '<span class="muted">No genera rendimiento</span>'}</span>
+      <span>${info.join(' · ')}</span>
       <span class="row">
         <button type="button" class="btn ghost sm" data-bank-edit="${b.id}">Editar</button>
         <button type="button" class="btn danger sm icon" data-bank-delete="${b.id}" aria-label="Eliminar banco ${esc(b.name)}" title="Eliminar banco">🗑</button>
@@ -870,6 +870,26 @@ function openAccountForm(acc?: Account, preset: { bankId?: number } = {}): void 
       ${field('Color', `<input type="color" name="color" value="${esc(color)}" />`)}
       ${acc ? `<label class="v-money-check"><input type="checkbox" name="archived" ${acc.archived ? 'checked' : ''} /> Archivar cuenta (ya no la uso)</label>` : ''}
     </form>`,
+    onOpen: (form) => {
+      const sel = form.querySelector<HTMLSelectElement>('[data-bank-select]');
+      if (!sel) return;
+      let prev = sel.value === NEW_BANK ? '' : sel.value;
+      sel.addEventListener('change', () => {
+        if (sel.value !== NEW_BANK) {
+          prev = sel.value;
+          return;
+        }
+        // Se regresa a la opción anterior; si se guarda el banco nuevo, queda seleccionado.
+        sel.value = prev;
+        openBankForm(undefined, (saved) => {
+          if (!document.contains(sel)) return;
+          const list = (data?.banks ?? []).some((b) => b.id === saved.id) ? (data?.banks ?? []) : [...(data?.banks ?? []), saved];
+          sel.innerHTML = bankOptionsHtml(list, String(saved.id), legacyName);
+          sel.value = String(saved.id);
+          prev = sel.value;
+        });
+      });
+    },
     onSubmit: async (v, _form, modal) => {
       const name = (v.name ?? '').trim();
       if (!name) throw new Error('El nombre es obligatorio');
@@ -880,12 +900,21 @@ function openAccountForm(acc?: Account, preset: { bankId?: number } = {}): void 
       const k = KINDS.includes(v.kind as AccountKind) ? (v.kind as AccountKind) : 'disponible';
       const body: AccountInput = {
         name,
-        bank: (v.bank ?? '').trim(),
+        earns_yield: v.earns_yield === 'on',
         kind: k,
         opening_balance: round2(opening),
         opening_date: v.opening_date,
         color: HEX_RE.test(v.color ?? '') ? v.color : DEFAULT_COLOR,
       };
+      const rawBank = v.bank_id ?? '';
+      if (rawBank === '') body.bank_id = null;
+      else if (rawBank === NEW_BANK) throw new Error('Elige un banco');
+      else if (rawBank !== KEEP_BANK) {
+        // KEEP_BANK: no se envía bank_id y el servidor conserva el banco escrito
+        const bankId = Number(rawBank);
+        if (!Number.isInteger(bankId) || bankId <= 0) throw new Error('Elige un banco válido');
+        body.bank_id = bankId;
+      }
       let msg = 'Cuenta creada';
       if (acc) {
         body.archived = v.archived === 'on';
@@ -959,14 +988,14 @@ function openAdjustForm(acc: Account): void {
   });
 }
 
-function openTransferForm(fromId?: number): void {
+function openTransferForm(opts: { fromId?: number; toId?: number; amount?: number } = {}): void {
   const active = activeAccounts();
   if (active.length < 2) {
     toast(TRANSFER_DISABLED_MSG, 'error');
     return;
   }
-  const from = active.find((a) => a.id === fromId) ?? active[0];
-  const to = active.find((a) => a.id !== from.id) ?? active[1];
+  const from = active.find((a) => a.id === opts.fromId) ?? active[0];
+  const to = active.find((a) => a.id === opts.toId && a.id !== from.id) ?? active.find((a) => a.id !== from.id) ?? active[1];
   const options = (selectedId: number) =>
     active.map((a) => ({ value: a.id, label: `${a.name} · ${bankLabel(a)} (${money(a.balance)})`, selected: a.id === selectedId }));
   formModal({
@@ -978,7 +1007,7 @@ function openTransferForm(fromId?: number): void {
         ${field('Hacia', select('to_account_id', options(to.id)))}
       </div>
       <div class="form-row">
-        ${field('Monto', moneyInput('amount'))}
+        ${field('Monto', moneyInput('amount', opts.amount !== undefined && opts.amount > 0 ? round2(opts.amount) : null))}
         ${field('Fecha', input('date', { type: 'date', value: todayISO(), required: true }))}
       </div>
       ${field('Nota', input('note', { placeholder: 'Opcional' }))}
@@ -1011,6 +1040,185 @@ function openTransferForm(fromId?: number): void {
   });
 }
 
+/** Sugerencia de rendimiento: transferencia con cuentas y monto prellenados. */
+function openSuggestedTransfer(s: YieldSuggestion): void {
+  const { from, to } = suggestionPlan(s);
+  if (!to) {
+    openAccountForm(undefined, { bankId: s.to_bank_id });
+    return;
+  }
+  if (!from || from.id === to.id) {
+    toast(`No encontramos una cuenta con saldo en ${s.from_bank}`, 'error');
+    return;
+  }
+  // Si la cuenta de mayor saldo no alcanza (el excedente está repartido), se prellena lo que tiene.
+  const amount = round2(Math.min(s.amount, Math.max(0, from.balance)));
+  openTransferForm({ fromId: from.id, toId: to.id, amount: amount > 0 ? amount : s.amount });
+}
+
+function openBankForm(bank?: Bank, onSaved?: (saved: Bank) => void): void {
+  const color = bank && HEX_RE.test(bank.color) ? bank.color : DEFAULT_COLOR;
+  const hasCap = bank ? bank.yield_cap !== null : false;
+  const taken = new Set((data?.banks ?? []).filter((b) => b.id !== bank?.id).map((b) => bankKey(b.name)));
+  const names = BANK_SUGGESTIONS.filter((n) => !taken.has(bankKey(n)));
+  // Saldo que rinde hoy en el banco; sin cuentas (o en 0) se usa un ejemplo.
+  const sample = bank && bank.accounts_count > 0 && bank.yield_balance > 0 ? bank.yield_balance : null;
+  const renamingHelp = bank && bank.accounts_count > 0 ? 'Si cambias el nombre, también cambia en sus cuentas' : undefined;
+
+  formModal({
+    title: bank ? `Editar banco · ${bank.name}` : 'Nuevo banco',
+    submitLabel: bank ? 'Guardar cambios' : 'Crear banco',
+    html: `<form class="form">
+      <div class="form-row">
+        ${field(
+          'Nombre',
+          `<input type="text" name="name" list="v-money-bank-names" maxlength="80" value="${esc(bank?.name ?? '')}" placeholder="BBVA, Nu, DiDi…" autocomplete="off" required />
+          <datalist id="v-money-bank-names">${names.map((n) => `<option value="${esc(n)}"></option>`).join('')}</datalist>`,
+          renamingHelp,
+        )}
+        ${field('Color', `<input type="color" name="color" value="${esc(color)}" />`)}
+      </div>
+      ${field(
+        'Rendimiento anual (%)',
+        input('annual_rate', { type: 'number', step: '0.01', min: '0', max: '1000', value: bank ? bank.annual_rate : '', placeholder: 'Ej. 10.5', required: true }),
+        'Escribe la tasa vigente que te da tu banco (cambia seguido). Pon 0 si no da rendimiento.',
+      )}
+      <div class="v-money-field-check">
+        <label class="v-money-check"><input type="checkbox" name="has_cap" data-has-cap ${hasCap ? 'checked' : ''} /> Tiene tope</label>
+        <span class="help">Márcalo si la tasa solo aplica hasta cierto monto</span>
+      </div>
+      <div class="form-row ${hasCap ? '' : 'hidden'}" data-cap-fields>
+        ${field('Tope', moneyInput('yield_cap', bank?.yield_cap ?? null, '10000.00'), 'Monto máximo que genera la tasa anual')}
+        ${field(
+          '% por encima del tope',
+          input('rate_above_cap', { type: 'number', step: '0.01', min: '0', max: '1000', value: bank ? bank.rate_above_cap : 0, required: true }),
+          'Lo que rinde el dinero que pasa del tope (normalmente 0)',
+        )}
+      </div>
+      <p class="v-money-preview" data-preview aria-live="polite"></p>
+    </form>`,
+    onOpen: (form) => {
+      const capToggle = form.querySelector<HTMLInputElement>('[data-has-cap]');
+      const capBox = form.querySelector<HTMLElement>('[data-cap-fields]');
+      const out = form.querySelector<HTMLElement>('[data-preview]');
+      const val = (name: string): string => form.querySelector<HTMLInputElement>(`input[name="${name}"]`)?.value.trim() ?? '';
+      const preview = (): void => {
+        if (!out) return;
+        const rawRate = val('annual_rate');
+        const rate = Number(rawRate);
+        if (rawRate === '' || !Number.isFinite(rate) || rate < 0) {
+          out.textContent = 'Escribe el rendimiento anual para ver cuánto rendirías.';
+          return;
+        }
+        const capOn = !!capToggle?.checked;
+        const rawCap = val('yield_cap');
+        const capNum = Number(rawCap);
+        const cap = capOn && rawCap !== '' && Number.isFinite(capNum) && capNum >= 0 ? capNum : null;
+        const aboveNum = Number(val('rate_above_cap'));
+        const above = capOn && Number.isFinite(aboveNum) && aboveNum > 0 ? aboveNum : 0;
+        const balance = sample ?? EXAMPLE_BALANCE;
+        const monthly = previewMonthly(balance, rate, cap, above);
+        out.innerHTML = `Con <strong class="white num">${esc(moneyRound(balance))}</strong> en este banco rendirías ~<strong class="white num">${esc(money(monthly))}</strong> al mes${
+          sample === null ? ' <span class="muted">(ejemplo)</span>' : ''
+        }${capOn && cap === null ? ' <span class="muted">· escribe el tope</span>' : ''}`;
+      };
+      const syncCap = (): void => {
+        const on = !!capToggle?.checked;
+        capBox?.classList.toggle('hidden', !on);
+        // Los campos ocultos se deshabilitan para que su "required" no bloquee el envío.
+        capBox?.querySelectorAll<HTMLInputElement>('input').forEach((i) => (i.disabled = !on));
+        preview();
+      };
+      capToggle?.addEventListener('change', syncCap);
+      form.addEventListener('input', preview);
+      syncCap();
+    },
+    onSubmit: async (v, _form, modal) => {
+      const name = (v.name ?? '').trim();
+      if (!name) throw new Error('El nombre es obligatorio');
+      const rawRate = (v.annual_rate ?? '').trim();
+      if (rawRate === '') throw new Error('Escribe el rendimiento anual (0 si no da rendimiento)');
+      const rate = toNumber(rawRate, 'rendimiento anual');
+      if (rate < 0 || rate > 1000) throw new Error('El rendimiento anual debe estar entre 0% y 1000%');
+      const capOn = v.has_cap === 'on';
+      let cap: number | null = null;
+      let above = 0;
+      if (capOn) {
+        const rawCap = (v.yield_cap ?? '').trim();
+        if (rawCap === '') throw new Error('Escribe el tope o desmarca "Tiene tope"');
+        cap = toNumber(rawCap, 'tope');
+        if (cap < 0) throw new Error('El tope no puede ser negativo');
+        const rawAbove = (v.rate_above_cap ?? '').trim();
+        above = rawAbove === '' ? 0 : toNumber(rawAbove, '% por encima del tope');
+        if (above < 0 || above > 1000) throw new Error('El % por encima del tope debe estar entre 0% y 1000%');
+      }
+      const body: BankInput = {
+        name,
+        color: HEX_RE.test(v.color ?? '') ? v.color : DEFAULT_COLOR,
+        annual_rate: rate,
+        yield_cap: cap === null ? null : round2(cap),
+        rate_above_cap: above,
+      };
+      const saved = bank ? await api.put<Bank>(`/api/banks/${bank.id}`, body) : await api.post<Bank>('/api/banks', body);
+      modal.close();
+      toast(bank ? 'Banco actualizado' : 'Banco creado');
+      await load('all');
+      onSaved?.(saved);
+    },
+  });
+}
+
+async function deleteBank(bank: Bank): Promise<void> {
+  const ok = await confirmDialog(`Se eliminará el banco "${bank.name}" y su configuración de rendimiento. Solo se puede si no tiene cuentas.`, {
+    title: 'Eliminar banco',
+    okLabel: 'Eliminar banco',
+  });
+  if (!ok) return;
+  try {
+    await api.del(`/api/banks/${bank.id}`);
+    toast('Banco eliminado');
+    await load('all');
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 409) toast(err.message, 'error', 6000);
+    else showError(err);
+  }
+}
+
+function openYieldForm(acc: Account): void {
+  const bank = bankById(acc.bank_id);
+  const today = todayISO();
+  const estimate = acc.est_yield_month > 0 ? acc.est_yield_month : null;
+  formModal({
+    title: `Registrar rendimiento · ${acc.name}`,
+    submitLabel: 'Registrar rendimiento',
+    html: `<form class="form">
+      ${
+        bank
+          ? `<div class="v-money-adjust-now"><span class="muted">${esc(bank.name)} · ${esc(bankTermsText(bank))}</span><span>Estimado: <strong class="white num">~${esc(money(acc.est_yield_month))}</strong>/mes</span></div>`
+          : ''
+      }
+      ${field('Monto', moneyInput('amount', estimate), 'Lo que te pagó el banco de intereses; se suma al saldo de la cuenta')}
+      <div class="form-row">
+        ${field('Fecha', input('date', { type: 'date', value: today, required: true, min: acc.opening_date }))}
+        ${field('Nota', input('note', { placeholder: 'Opcional' }))}
+      </div>
+    </form>`,
+    onSubmit: async (v, _form, modal) => {
+      const raw = (v.amount ?? '').trim();
+      if (raw === '') throw new Error('Escribe el monto que te pagó el banco');
+      const amount = round2(toNumber(raw, 'monto'));
+      if (!(amount > 0)) throw new Error('El monto debe ser mayor a 0');
+      const date = v.date || today;
+      if (date < acc.opening_date) throw new Error(`La fecha no puede ser anterior a la apertura de la cuenta (${fmtDate(acc.opening_date)})`);
+      const body: YieldInput = { amount, date, note: (v.note ?? '').trim() };
+      await api.post<Account>(`/api/accounts/${acc.id}/yield`, body);
+      modal.close();
+      toast('Rendimiento registrado');
+      await load('all');
+    },
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Movimientos de una cuenta
 // ---------------------------------------------------------------------------
@@ -1018,8 +1226,9 @@ function movementRowHtml(m: AccountMovement): string {
   const label = SOURCE_LABELS[m.source] ?? m.source;
   const desc = m.description && m.description !== label ? `<div class="v-money-mv-desc">${esc(m.description)}</div>` : '';
   let action = '';
-  if (m.ref_id !== null && m.source === 'adjustment') {
-    action = `<button type="button" class="btn ghost sm icon" data-del-adjust="${m.ref_id}" aria-label="Eliminar ajuste" title="Eliminar ajuste">🗑</button>`;
+  if (m.ref_id !== null && (m.source === 'adjustment' || m.source === 'yield')) {
+    const what = m.source === 'yield' ? 'rendimiento' : 'ajuste';
+    action = `<button type="button" class="btn ghost sm icon" data-del-adjust="${m.ref_id}" data-adjust-kind="${m.source}" aria-label="Eliminar ${what}" title="Eliminar ${what}">🗑</button>`;
   } else if (m.ref_id !== null && (m.source === 'transfer_in' || m.source === 'transfer_out')) {
     action = `<button type="button" class="btn ghost sm icon" data-del-transfer="${m.ref_id}" aria-label="Eliminar transferencia" title="Eliminar transferencia">🗑</button>`;
   } else if (SOURCE_LINKS[m.source]) {
@@ -1087,11 +1296,14 @@ async function openMovements(acc: Account): Promise<void> {
   on(modal.body, 'click', '[data-del-adjust]', async (el) => {
     const id = el.dataset.delAdjust;
     if (!id) return;
-    const ok = await confirmDialog('Se eliminará este ajuste de saldo y el saldo de la cuenta cambiará.', { title: 'Eliminar ajuste', okLabel: 'Eliminar ajuste' });
+    const isYield = el.dataset.adjustKind === 'yield';
+    const ok = isYield
+      ? await confirmDialog('Se eliminará este rendimiento registrado y el saldo de la cuenta cambiará.', { title: 'Eliminar rendimiento', okLabel: 'Eliminar rendimiento' })
+      : await confirmDialog('Se eliminará este ajuste de saldo y el saldo de la cuenta cambiará.', { title: 'Eliminar ajuste', okLabel: 'Eliminar ajuste' });
     if (!ok) return;
     try {
       await api.del(`/api/accounts/${acc.id}/adjustments/${id}`);
-      await afterDelete('Ajuste eliminado');
+      await afterDelete(isYield ? 'Rendimiento eliminado' : 'Ajuste eliminado');
     } catch (err) {
       showError(err);
     }

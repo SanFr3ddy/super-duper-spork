@@ -136,7 +136,7 @@ dashboardRouter.get('/', async (req, res) => {
   const cmMonth = year === curYear ? curMonth : 12;
   const cm = monthRange(cmYear, cmMonth);
 
-  const [txRows, cardPayRows, loanPayRows, goalContribRows, expensesByCategory, incomeByCategory, cmExpensesByCategory, budgetRow, cardRows, loanRows, loanPaymentRows, goalRows, recentRows, yearRows, accounts, planSources, recurringOv] =
+  const [txRows, cardPayRows, loanPayRows, goalContribRows, expensesByCategory, incomeByCategory, cmExpensesByCategory, budgetRow, cardRows, loanRows, loanPaymentRows, goalRows, recentRows, yearRows, { accounts, yields }, planSources, recurringOv] =
     await Promise.all([
       query<TxMonthRow>(
         `SELECT EXTRACT(MONTH FROM date)::int AS m,
@@ -212,14 +212,15 @@ dashboardRouter.get('/', async (req, res) => {
            UNION SELECT DISTINCT EXTRACT(YEAR FROM date)::int FROM goal_contributions
          ) u ORDER BY y DESC`,
       ),
-      loadAccounts(),
+      // Cuentas a hoy y, encadenados, los rendimientos (loadBanks reutiliza la lista completa de cuentas;
+      // server/accountsData.ts + server/yields.ts). Van en paralelo con el resto de consultas.
+      loadAccounts().then(async (accounts) => {
+        const banks = await loadBanks(accounts);
+        return { accounts, yields: await yieldsSummary(banks, curYear) };
+      }),
       loadPlanSources(),
       recurringOverview(today),
     ]);
-
-  // Rendimientos a hoy: reutiliza la lista completa de cuentas (server/accountsData.ts + server/yields.ts).
-  const banks = await loadBanks(accounts);
-  const yields = await yieldsSummary(banks, curYear);
 
   // --- Meses (siempre 12) ---
   const months: MonthSummary[] = Array.from({ length: 12 }, (_, i) => ({

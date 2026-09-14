@@ -756,7 +756,7 @@ function openForm(existing?: RecurringCharge): void {
             backfillInfo.textContent =
               count === 0
                 ? 'No hay cargos entre la fecha de inicio y ayer.'
-                : `Se registrarán ${plural(count, 'cargo pasado', 'cargos pasados')}${Number.isFinite(amount) && amount > 0 ? ` (${money(amount * count)})` : ''}${past.length > 400 ? ' · máximo 400' : ''}.`;
+                : `${count === 1 ? 'Se registrará' : 'Se registrarán'} ${plural(count, 'cargo pasado', 'cargos pasados')}${Number.isFinite(amount) && amount > 0 ? ` (${money(amount * count)})` : ''}${past.length > 400 ? ' · máximo 400' : ''}.`;
           } else backfillInfo.textContent = canBackfill ? 'Si no lo marcas, solo se registra desde hoy.' : '';
         }
 

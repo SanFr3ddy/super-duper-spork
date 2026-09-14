@@ -384,7 +384,7 @@ function habitsHtml(d: DashboardYear): string {
       items.push({
         icon: '📈',
         text: s
-          ? `Tienes ${money(s.amount)} sin rendir en ${s.from_bank}: muévelo a ${s.to_bank}.`
+          ? `Mueve ${money(s.amount)} de ${s.from_bank} a ${s.to_bank}: ganarías ~${money(s.extra_year)} más al año.`
           : `Tienes ${money(m.over_cap_total)} por encima de tus topes de rendimiento.`,
       });
     }
@@ -571,7 +571,7 @@ function moneyCard(d: DashboardYear): string {
           <span class="red">Tienes ${esc(money(m.over_cap_total))} por encima de tus topes de rendimiento</span>
           ${
             s
-              ? `<a href="#/dinero">Muévelos a ${esc(s.to_bank)}: +${esc(money(s.extra_year))}/año →</a>`
+              ? `<a href="#/dinero">Mueve ${esc(money(s.amount))} de ${esc(s.from_bank)} a ${esc(s.to_bank)}: +${esc(money(s.extra_year))}/año →</a>`
               : '<a href="#/dinero">Revisa tus bancos →</a>'
           }
         </div>`
@@ -669,7 +669,7 @@ function recentHtml(items: Transaction[]): string {
         const meta = [fmtDateShort(t.date), t.category_name ?? 'Sin categoría', sourceLabel(t)].filter(Boolean).join(' · ');
         return `<div class="list-item">
           <div class="icon-box">${esc(icon)}</div>
-          <div class="grow"><div class="name">${esc(title)}</div><div class="meta">${t.recurring_id != null ? '<span class="dash-auto" title="Registrado por un cargo recurrente" aria-label="Cargo recurrente">🔁</span> ' : ''}${esc(meta)}</div></div>
+          <div class="grow"><div class="name">${esc(title)}</div><div class="meta">${t.recurring_id != null ? '<span class="dash-auto" role="img" title="Registrado por un cargo recurrente" aria-label="Cargo recurrente">🔁</span> ' : ''}${esc(meta)}</div></div>
           <span class="amt amount ${isIncome ? 'income' : 'expense'}">${esc(moneySigned(isIncome ? t.amount : -t.amount))}</span>
         </div>`;
       })

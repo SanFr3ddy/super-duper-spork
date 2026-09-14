@@ -2,7 +2,7 @@
  * Vista "Tarjetas": tarjetas de crédito con deuda, utilización, fechas de corte/pago,
  * compras a meses (mensualidades), registro de pagos (con la cuenta usada) y consulta de movimientos.
  */
-import type { Account, CreditCard, CreditCardInput, CardPayment, CardPaymentInput, InstallmentPlan, InstallmentsResponse, Transaction } from '../../../shared/types';
+import type { Account, Category, CreditCard, CreditCardInput, CardPayment, CardPaymentInput, InstallmentPlan, InstallmentSegment, InstallmentsResponse, Transaction, TransactionInput } from '../../../shared/types';
 import { api, qs } from '../api';
 import { esc, money, pct, fmtDate, daysUntil, todayISO, monthName, MONTHS_SHORT, currentYear, currentMonth } from '../format';
 import { formModal, openModal, confirmDialog, toast, showError, field, input, moneyInput, select, emptyState, loadingState, progressBar, periodPicker, on, toNumber } from '../ui';
@@ -17,6 +17,7 @@ let cards: CreditCard[] = [];
 let loadSeq = 0;
 let instSeq = 0;
 let instCanvas: HTMLCanvasElement | null = null;
+let instData: InstallmentsResponse | null = null;
 const instPeriod = { year: currentYear(), month: currentMonth() };
 
 const STYLE = `
@@ -73,6 +74,14 @@ const STYLE = `
   .v-cards-modal .v-panel-foot { margin-top: 12px; }
   .v-cards-modal .v-desc-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
   .v-cards-modal .v-msi { flex: none; }
+  .v-plan-form .v-seg-list { display: flex; flex-direction: column; gap: 8px; }
+  .v-plan-form .v-seg { display: grid; grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr) auto; gap: 8px; align-items: end; }
+  .v-plan-form .v-seg .field label { font-size: .75rem; }
+  .v-plan-form .v-plan-sum { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; font-size: .88rem; }
+  .v-plan-form .v-plan-sum.bad { border-color: var(--red-border); background: var(--red-soft); }
+  .v-plan-form .v-plan-sched { color: var(--text-2); font-size: .85rem; line-height: 1.5; }
+  .v-cards .v-seg-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .v-cards .v-seg-chips .chip { font-size: .72rem; padding: 1px 7px; }
 </style>`;
 
 // ---------------------------------------------------------------------------
@@ -293,11 +302,14 @@ function installmentsBodyHtml(d: InstallmentsResponse): string {
           </div>
         </td>
         <td class="amount">${money(p.total)}</td>
-        <td class="amount">${money(p.monthly_amount)}<div class="muted small">${p.installments} meses</div></td>
+        <td class="amount">${money(p.monthly_amount)}<div class="muted small">${p.installments} meses${p.custom_plan ? ' · desglose' : ''}</div>${
+          p.custom_plan && p.segments ? `<div class="v-seg-chips">${p.segments.map((sg) => `<span class="chip">${sg.months}×${money(sg.amount)}</span>`).join('')}</div>` : ''
+        }</td>
         <td>${progressCell(p)}</td>
         <td class="amount ${p.due_this_month > 0 ? 'expense' : 'muted'}">${money(p.due_this_month)}</td>
         <td class="amount">${money(p.remaining_amount)}</td>
         <td class="nowrap">${esc(ymShort(p.last_month))}</td>
+        <td class="actions"><button type="button" class="btn ghost sm" data-action="edit-plan" data-tx="${p.transaction_id}" title="Editar desglose">✎ Desglose</button></td>
       </tr>`;
     })
     .join('');
@@ -305,7 +317,7 @@ function installmentsBodyHtml(d: InstallmentsResponse): string {
   const table = `
     <div class="table-wrap v-inst-table">
       <table>
-        <thead><tr><th>Compra</th><th class="amount">Total</th><th class="amount">Mensualidad</th><th>Avance</th><th class="amount">${esc(colLabel)}</th><th class="amount">Restante</th><th>Termina</th></tr></thead>
+        <thead><tr><th>Compra</th><th class="amount">Total</th><th class="amount">Mensualidad</th><th>Avance</th><th class="amount">${esc(colLabel)}</th><th class="amount">Restante</th><th>Termina</th><th></th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>`;
@@ -317,7 +329,7 @@ function installmentsSectionHtml(): string {
   return `
     <div class="card-head">
       <h2>🗓️ Compras a meses</h2>
-      <div data-inst-period></div>
+      <div class="row"><button type="button" class="btn primary sm" data-action="new-plan">+ Compra a meses</button><div data-inst-period></div></div>
     </div>
     <div data-inst-body>${loadingState('Cargando compras a meses…')}</div>`;
 }
@@ -333,6 +345,7 @@ async function loadInstallments(): Promise<void> {
     if (my !== instSeq || wrap !== el || !body.isConnected) return;
     destroyChart(instCanvas);
     instCanvas = null;
+    instData = res;
     body.innerHTML = installmentsBodyHtml(res);
     const canvas = body.querySelector<HTMLCanvasElement>('[data-inst-chart]');
     if (canvas) {
@@ -387,8 +400,9 @@ export async function render(root: HTMLElement): Promise<void> {
 
   const actions = document.getElementById('topbar-actions');
   if (actions) {
-    actions.innerHTML = '<button type="button" class="btn primary" id="v-cards-new">+ Nueva tarjeta</button>';
+    actions.innerHTML = '<button type="button" class="btn" id="v-cards-plan">+ Compra a meses</button><button type="button" class="btn primary" id="v-cards-new">+ Nueva tarjeta</button>';
     actions.querySelector('#v-cards-new')?.addEventListener('click', () => openCardForm());
+    actions.querySelector('#v-cards-plan')?.addEventListener('click', () => void openPlanForm());
   }
 
   const periodEl = el.querySelector<HTMLElement>('[data-inst-period]');
@@ -414,6 +428,15 @@ export async function render(root: HTMLElement): Promise<void> {
       void loadInstallments();
       return;
     }
+    if (action === 'new-plan') {
+      void openPlanForm();
+      return;
+    }
+    if (action === 'edit-plan') {
+      const plan = instData?.items.find((p) => p.transaction_id === Number(btn.dataset.tx));
+      if (plan) void openPlanForm(plan);
+      return;
+    }
     const id = Number(btn.closest<HTMLElement>('[data-id]')?.dataset.id);
     const card = cards.find((c) => c.id === id);
     if (!card) return;
@@ -427,6 +450,7 @@ export async function render(root: HTMLElement): Promise<void> {
 }
 
 export function destroy(): void {
+  instData = null;
   loadSeq += 1;
   instSeq += 1;
   destroyChart(instCanvas);
@@ -690,4 +714,224 @@ function openMovements(card: CreditCard): void {
   });
 
   void Promise.all([loadPayments(), loadCharges()]);
+}
+
+// ---------------------------------------------------------------------------
+// Compra a meses con desglose (alta desde Tarjetas y edición del desglose)
+// Reglas en server/installments.ts: la suma de los tramos debe ser igual al total; primera mensualidad = mes elegido.
+// ---------------------------------------------------------------------------
+const r2 = (n: number): number => Math.round((Number(n) || 0) * 100) / 100;
+
+function addYM(ym: string, n: number): string {
+  const [y, m] = ym.split('-').map(Number);
+  const t = y * 12 + (m - 1) + n;
+  return `${Math.floor(t / 12)}-${String((t % 12) + 1).padStart(2, '0')}`;
+}
+
+function equalSegments(total: number, n: number): InstallmentSegment[] {
+  const monthly = r2(total / n);
+  const last = r2(total - monthly * (n - 1));
+  return last === monthly || n === 1 ? [{ months: n, amount: monthly }] : [{ months: n - 1, amount: monthly }, { months: 1, amount: last }];
+}
+
+function segRowHtml(seg?: InstallmentSegment): string {
+  return `<div class="v-seg">
+    ${field('Meses', `<input type="number" data-seg-months min="1" max="48" step="1" value="${seg ? seg.months : ''}" placeholder="5" />`)}
+    ${field('Monto por mes', `<input type="number" data-seg-amount min="0.01" step="0.01" value="${seg ? seg.amount : ''}" placeholder="400.00" />`)}
+    <button type="button" class="btn ghost sm icon" data-seg-del aria-label="Quitar tramo" title="Quitar tramo">🗑</button>
+  </div>`;
+}
+
+async function openPlanForm(plan?: InstallmentPlan): Promise<void> {
+  const isEdit = !!plan;
+  let cats: Category[] = [];
+  if (!isEdit) {
+    if (cards.length === 0) {
+      toast('Primero agrega una tarjeta', 'error');
+      return;
+    }
+    cats = await api.get<Category[]>('/api/categories?type=expense').catch(() => [] as Category[]);
+  }
+  const today = todayISO();
+  const purchase = plan ? plan.purchase_date : today;
+  const customStart = !!(plan && plan.custom_plan);
+  const defaultFirst = addYM(purchase.slice(0, 7), 1);
+  const firstMonth = plan ? plan.first_month : defaultFirst;
+
+  const html = `<form class="form v-plan-form">
+    ${
+      isEdit
+        ? `<div class="row between"><span class="chip">💳 ${esc(plan!.card_name)}</span><span class="muted small">${esc(plan!.description)} · ${esc(fmtDate(plan!.purchase_date))}</span></div>`
+        : `<div class="form-row">
+            ${field('Tarjeta', select('credit_card_id', cards.map((c) => ({ value: c.id, label: c.name }))))}
+            ${field('Fecha de compra', input('date', { type: 'date', value: today, required: true }))}
+          </div>
+          ${field('¿Qué compraste?', input('description', { placeholder: 'Laptop, refrigerador, celular…', required: true }))}
+          ${field('Categoría', select('category_id', [{ value: '', label: 'Sin categoría' }, ...cats.map((c) => ({ value: c.id, label: `${c.icon ? c.icon + ' ' : ''}${c.name}` }))]))}`
+    }
+    ${field('Total de la compra', moneyInput('amount', plan ? plan.total : null), 'Si tiene intereses, escribe el total que pagarás')}
+    <div class="field">
+      <label>¿Cómo se paga?</label>
+      <div class="segmented" data-mode role="group">
+        <button type="button" data-mode-btn="equal" class="${customStart ? '' : 'active'}">Pagos iguales</button>
+        <button type="button" data-mode-btn="custom" class="${customStart ? 'active' : ''}">Desglose por tramos</button>
+      </div>
+    </div>
+    <div data-equal class="${customStart ? 'hidden' : ''}">
+      ${field('Número de meses', `<input type="number" name="months" min="2" max="48" step="1" value="${plan && !customStart ? plan.installments : 12}" />`)}
+    </div>
+    <div data-custom class="${customStart ? '' : 'hidden'}">
+      <div class="v-seg-list" data-seg-list>${(customStart && plan!.segments ? plan!.segments : [undefined, undefined]).map((sg) => segRowHtml(sg)).join('')}</div>
+      <button type="button" class="btn sm mt" data-seg-add>+ Agregar tramo</button>
+    </div>
+    ${field('Primera mensualidad', `<select name="first_month" data-first></select>`)}
+    <div class="v-plan-sum" data-sum aria-live="polite"></div>
+  </form>`;
+
+  formModal({
+    title: isEdit ? `Desglose · ${plan!.description}` : 'Nueva compra a meses',
+    wide: true,
+    submitLabel: isEdit ? 'Guardar desglose' : 'Registrar compra',
+    html,
+    onOpen: (form) => {
+      let mode: 'equal' | 'custom' = customStart ? 'custom' : 'equal';
+      const $ = <T extends Element>(sel: string): T | null => form.querySelector<T>(sel);
+      const amountEl = $<HTMLInputElement>('input[name="amount"]')!;
+      const monthsEl = $<HTMLInputElement>('input[name="months"]')!;
+      const dateEl = $<HTMLInputElement>('input[name="date"]');
+      const firstEl = $<HTMLSelectElement>('[data-first]')!;
+      const list = $<HTMLElement>('[data-seg-list]')!;
+      const sumEl = $<HTMLElement>('[data-sum]')!;
+
+      const fillFirst = (): void => {
+        const pd = (dateEl?.value || purchase).slice(0, 7);
+        const same = pd;
+        const next = addYM(pd, 1);
+        const current = firstEl.value || firstMonth;
+        const opts = [
+          { v: next, l: `El mes siguiente a la compra (${ymLong(next)})` },
+          { v: same, l: `El mismo mes de la compra (${ymLong(same)})` },
+        ];
+        if (current && current !== next && current !== same) opts.push({ v: current, l: `${ymLong(current)}` });
+        firstEl.innerHTML = opts.map((o) => `<option value="${o.v}" ${o.v === current ? 'selected' : ''}>${esc(o.l)}</option>`).join('');
+        if (!opts.some((o) => o.v === current)) firstEl.value = next;
+      };
+
+      const readSegments = (): InstallmentSegment[] =>
+        [...list.querySelectorAll<HTMLElement>('.v-seg')]
+          .map((row) => ({
+            months: Math.floor(Number(row.querySelector<HTMLInputElement>('[data-seg-months]')?.value)),
+            amount: r2(Number(row.querySelector<HTMLInputElement>('[data-seg-amount]')?.value)),
+          }))
+          .filter((sg) => sg.months >= 1 && sg.amount > 0);
+
+      const update = (): void => {
+        const total = r2(Number(amountEl.value));
+        const first = firstEl.value || firstMonth;
+        let segs: InstallmentSegment[] = [];
+        let n = 0;
+        if (mode === 'equal') {
+          n = Math.floor(Number(monthsEl.value));
+          if (total > 0 && n >= 2) segs = equalSegments(total, n);
+        } else {
+          segs = readSegments();
+          n = segs.reduce((a, sg) => a + sg.months, 0);
+        }
+        const sum = r2(segs.reduce((a, sg) => a + sg.months * sg.amount, 0));
+        const diff = r2(sum - total);
+        const bad = mode === 'custom' && (n < 2 || n > 48 || !(total > 0) || Math.abs(diff) > 0.05);
+        let cursor = 0;
+        const sched = segs
+          .map((sg) => {
+            const from = addYM(first, cursor);
+            const to = addYM(first, cursor + sg.months - 1);
+            cursor += sg.months;
+            return `${from === to ? ymShort(from) : `${ymShort(from)} – ${ymShort(to)}`}: <strong class="num">${esc(money(sg.amount))}</strong> al mes`;
+          })
+          .join('<br />');
+        sumEl.classList.toggle('bad', bad);
+        sumEl.innerHTML = `
+          <div class="row between"><span>${n} ${n === 1 ? 'mes' : 'meses'} · suma <strong class="num">${esc(money(sum))}</strong></span><span class="muted">Total ${esc(money(total))}</span></div>
+          ${
+            mode === 'custom' && total > 0 && Math.abs(diff) > 0.05
+              ? `<div class="red">${diff > 0 ? 'Te pasas por' : 'Faltan'} ${esc(money(Math.abs(diff)))} para cuadrar con el total. <button type="button" class="btn ghost sm" data-fit>Usar ${esc(money(sum))} como total</button></div>`
+              : ''
+          }
+          ${n > 48 ? '<div class="red">Máximo 48 meses.</div>' : ''}
+          ${sched ? `<div class="v-plan-sched">${sched}</div>` : '<div class="muted">Escribe el total y cómo se reparte.</div>'}`;
+      };
+
+      form.querySelectorAll<HTMLButtonElement>('[data-mode-btn]').forEach((b) =>
+        b.addEventListener('click', () => {
+          mode = b.dataset.modeBtn === 'custom' ? 'custom' : 'equal';
+          form.querySelectorAll<HTMLButtonElement>('[data-mode-btn]').forEach((x) => x.classList.toggle('active', x === b));
+          $('[data-equal]')?.classList.toggle('hidden', mode !== 'equal');
+          $('[data-custom]')?.classList.toggle('hidden', mode !== 'custom');
+          update();
+        }),
+      );
+      $('[data-seg-add]')?.addEventListener('click', () => {
+        list.insertAdjacentHTML('beforeend', segRowHtml());
+        update();
+      });
+      list.addEventListener('click', (e) => {
+        const del = (e.target as HTMLElement).closest('[data-seg-del]');
+        if (!del) return;
+        if (list.querySelectorAll('.v-seg').length > 1) del.closest('.v-seg')?.remove();
+        update();
+      });
+      sumEl.addEventListener('click', (e) => {
+        if (!(e.target as HTMLElement).closest('[data-fit]')) return;
+        const segs = readSegments();
+        amountEl.value = String(r2(segs.reduce((a, sg) => a + sg.months * sg.amount, 0)));
+        update();
+      });
+      form.addEventListener('input', update);
+      dateEl?.addEventListener('change', () => {
+        fillFirst();
+        update();
+      });
+      firstEl.addEventListener('change', update);
+      fillFirst();
+      update();
+      (mode === 'custom' ? list.querySelector<HTMLInputElement>('[data-seg-months]') : amountEl)?.focus();
+      (form as HTMLFormElement & { _plan?: () => { mode: string; segs: InstallmentSegment[] } })._plan = () => ({ mode, segs: readSegments() });
+    },
+    onSubmit: async (v, form, modal) => {
+      const getter = (form as HTMLFormElement & { _plan?: () => { mode: string; segs: InstallmentSegment[] } })._plan;
+      const state = getter ? getter() : { mode: 'equal', segs: [] as InstallmentSegment[] };
+      const amount = toNumber(v.amount ?? '', 'total');
+      if (!(amount > 0)) throw new Error('Escribe el total de la compra');
+      const first = v.first_month || null;
+      const planBody: Partial<TransactionInput> =
+        state.mode === 'custom'
+          ? { installment_plan: state.segs }
+          : { installments: Math.floor(toNumber(v.months ?? '', 'meses')), installment_plan: null };
+      if (state.mode === 'custom' && state.segs.length === 0) throw new Error('Agrega al menos un tramo con meses y monto');
+      if (state.mode === 'equal' && !((planBody.installments ?? 0) >= 2 && (planBody.installments ?? 0) <= 48)) throw new Error('El número de meses debe estar entre 2 y 48');
+
+      if (isEdit) {
+        await api.put<Transaction>(`/api/transactions/${plan!.transaction_id}`, { amount, installment_first_month: first, ...planBody });
+        toast('Desglose actualizado');
+      } else {
+        const description = (v.description ?? '').trim();
+        if (!description) throw new Error('Escribe qué compraste');
+        const body: TransactionInput = {
+          type: 'expense',
+          amount,
+          date: v.date || today,
+          description,
+          category_id: v.category_id ? Number(v.category_id) : null,
+          credit_card_id: Number(v.credit_card_id),
+          installments: planBody.installments ?? 2,
+          installment_first_month: first,
+          ...planBody,
+        };
+        await api.post<Transaction>('/api/transactions', body);
+        toast('Compra a meses registrada');
+      }
+      modal.close();
+      await load();
+    },
+  });
 }
