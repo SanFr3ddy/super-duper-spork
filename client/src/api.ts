@@ -1,6 +1,8 @@
 /**
  * Cliente HTTP mínimo para /api. Lanza ApiError con el mensaje del servidor.
  * Si el servidor responde 401, emite el evento 'auth:required' en window para mostrar el login.
+ * Toda petición POST/PUT/DELETE exitosa emite 'app:mutated' (lo usa el widget de cartera en main.ts
+ * para refrescarse sin que cada vista tenga que saberlo).
  */
 export class ApiError extends Error {
   constructor(
@@ -35,6 +37,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     const err = (data as { error?: string; details?: unknown }) ?? {};
     throw new ApiError(res.status, err.error || `Error ${res.status}`, err.details);
   }
+  if (method !== 'GET') window.dispatchEvent(new CustomEvent('app:mutated'));
   return data as T;
 }
 

@@ -2,9 +2,9 @@
  * Punto de entrada del cliente: carga config, verifica sesión, monta el layout y enruta por hash.
  * Cada vista exporta render(root) y destroy().
  */
-import type { AppConfig, AuthStatus } from '../../shared/types';
+import type { Account, AppConfig, AuthStatus } from '../../shared/types';
 import { api } from './api';
-import { setConfig, esc } from './format';
+import { setConfig, esc, money } from './format';
 import { toast, showError } from './ui';
 import { destroyDetachedCharts } from './charts';
 import * as dashboard from './views/dashboard';
@@ -83,7 +83,10 @@ function renderLayout(): void {
         </div>
         <header class="topbar">
           <div class="title-block"><h1 id="page-title"></h1><div class="sub" id="page-subtitle"></div></div>
-          <div class="topbar-actions" id="topbar-actions"></div>
+          <div class="topbar-right">
+            <div class="wallet-chip" id="wallet-chip"></div>
+            <div class="topbar-actions" id="topbar-actions"></div>
+          </div>
         </header>
         <div id="view"></div>
       </main>
@@ -98,6 +101,123 @@ function renderLayout(): void {
       }
     }),
   );
+  initWalletWidget();
+}
+
+// ---------------------------------------------------------------------------
+// Cartera: chip persistente en la barra superior, visible en TODAS las vistas.
+// Muestra el dinero total en tus cuentas (tus "carteras": bancos, ahorro, inversión, efectivo)
+// y un desplegable con el detalle por cuenta. Se actualiza solo tras cualquier cambio guardado
+// en la app (evento 'app:mutated' de api.ts), sin que cada vista tenga que avisarle.
+// ---------------------------------------------------------------------------
+let walletAccounts: Account[] | null = null;
+let walletLoading = false;
+let walletOpen = false;
+let walletMutateTimer: number | undefined;
+
+function isDisponibleKind(k: Account['kind']): boolean {
+  return k === 'disponible' || k === 'efectivo';
+}
+
+function walletBankLabel(a: Pick<Account, 'bank' | 'kind'>): string {
+  const b = a.bank.trim();
+  if (b) return b;
+  return a.kind === 'efectivo' ? 'Efectivo' : 'Sin banco';
+}
+
+function renderWalletChip(): void {
+  const chip = document.getElementById('wallet-chip');
+  if (!chip) return;
+
+  if (walletLoading && walletAccounts === null) {
+    chip.innerHTML = `<span class="wallet-btn muted">💰 Cargando…</span>`;
+    return;
+  }
+  if (walletAccounts === null) {
+    // No se pudo cargar (p. ej. sin conexión momentánea): no interrumpe la vista, solo se oculta.
+    chip.innerHTML = '';
+    return;
+  }
+  const active = walletAccounts.filter((a) => !a.archived);
+  if (active.length === 0) {
+    chip.innerHTML = `<a href="#/dinero" class="wallet-btn wallet-empty">👛 Agrega tu cartera</a>`;
+    return;
+  }
+
+  const total = active.reduce((acc, a) => acc + a.balance, 0);
+  chip.innerHTML = `
+    <button type="button" class="wallet-btn ${walletOpen ? 'open' : ''}" id="wallet-toggle" aria-expanded="${walletOpen}">
+      <span class="wallet-ico">👛</span><span class="wallet-amt ${total < 0 ? 'red' : ''}">${esc(money(total))}</span><span class="wallet-caret">${walletOpen ? '▴' : '▾'}</span>
+    </button>
+    ${walletOpen ? walletPopoverHtml(active, total) : ''}`;
+
+  chip.querySelector('#wallet-toggle')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    walletOpen = !walletOpen;
+    renderWalletChip();
+  });
+  if (walletOpen) {
+    chip.querySelector('.wallet-popover')?.addEventListener('click', (e) => e.stopPropagation());
+  }
+}
+
+function walletPopoverHtml(active: Account[], total: number): string {
+  const disponible = active.filter((a) => isDisponibleKind(a.kind)).reduce((acc, a) => acc + a.balance, 0);
+  const guardado = total - disponible;
+  const sorted = [...active].sort((a, b) => b.balance - a.balance);
+  return `
+    <div class="wallet-popover">
+      <div class="wallet-split">
+        <div><span class="muted small">Disponible</span><div class="amt">${esc(money(disponible))}</div></div>
+        <div><span class="muted small">Guardado</span><div class="amt">${esc(money(guardado))}</div></div>
+      </div>
+      <div class="wallet-list">
+        ${sorted
+          .map(
+            (a) => `<div class="wallet-row">
+              <span class="dot" style="background:${esc(a.color)}"></span>
+              <span class="grow"><span class="name">${esc(a.name)}</span><span class="bank">${esc(walletBankLabel(a))}</span></span>
+              <span class="amt ${a.balance < 0 ? 'red' : ''}">${esc(money(a.balance))}</span>
+            </div>`,
+          )
+          .join('')}
+      </div>
+      <a href="#/dinero" class="wallet-manage">Administrar mi dinero →</a>
+    </div>`;
+}
+
+async function loadWallet(): Promise<void> {
+  if (authState.required && !authState.authenticated) return;
+  walletLoading = true;
+  if (walletAccounts === null) renderWalletChip();
+  try {
+    walletAccounts = await api.get<Account[]>('/api/accounts/list');
+  } catch {
+    // silencioso: el chip no es crítico para usar la app
+  } finally {
+    walletLoading = false;
+    renderWalletChip();
+  }
+}
+
+function initWalletWidget(): void {
+  walletOpen = false;
+  document.addEventListener('click', () => {
+    if (!walletOpen) return;
+    walletOpen = false;
+    renderWalletChip();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && walletOpen) {
+      walletOpen = false;
+      renderWalletChip();
+    }
+  });
+  window.addEventListener('app:mutated', () => {
+    window.clearTimeout(walletMutateTimer);
+    walletMutateTimer = window.setTimeout(() => void loadWallet(), 350);
+  });
+  void loadWallet();
 }
 
 async function route(): Promise<void> {

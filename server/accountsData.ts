@@ -118,10 +118,24 @@ export function bankLabel(a: Pick<Account, 'bank' | 'kind'>): string {
 /** Totales por banco de las cuentas activas, ordenados por total desc. */
 export function bankTotals(accounts: Account[]): BankTotal[] {
   const groups = new Map<string, BankTotal>();
+  // Para mostrar: la forma escrita más usada del banco; en empate, la de la cuenta más antigua (id menor).
+  const spellings = new Map<string, Map<string, { count: number; firstId: number }>>();
   for (const a of accounts) {
     if (a.archived) continue;
     const label = bankLabel(a);
     const key = label.toLocaleLowerCase('es');
+    const variants = spellings.get(key) ?? new Map<string, { count: number; firstId: number }>();
+    const v = variants.get(label) ?? { count: 0, firstId: a.id };
+    v.count += 1;
+    v.firstId = Math.min(v.firstId, a.id);
+    variants.set(label, v);
+    spellings.set(key, variants);
+  }
+  for (const a of accounts) {
+    if (a.archived) continue;
+    const key = bankLabel(a).toLocaleLowerCase('es');
+    const best = [...(spellings.get(key) ?? new Map()).entries()].sort((x, y) => y[1].count - x[1].count || x[1].firstId - y[1].firstId)[0];
+    const label = best ? best[0] : bankLabel(a);
     const g = groups.get(key) ?? { bank: label, total: 0, share: 0, accounts: 0, disponible: 0, guardado: 0 };
     g.total += a.balance;
     g.accounts += 1;

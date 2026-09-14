@@ -11,11 +11,13 @@ Aplicación web de finanzas personales para crear hábitos: registra ingresos y 
 
 | Sección | Qué hace |
 | --- | --- |
-| Resumen | Tarjetas de totales del año, gráficas mensuales (ingresos vs gastos, salidas apiladas, disponible), gastos por categoría, estado de tarjetas, préstamos y metas, hábitos del mes. |
-| Movimientos | Alta, edición y borrado de ingresos y gastos con categoría, fecha, descripción y tarjeta de crédito usada. Filtros por mes/año, tipo, categoría y búsqueda. |
-| Tarjetas | Tarjetas de crédito con límite, día de corte y fecha límite de pago. Deuda, utilización, registro de pagos e historial de compras. |
+| Cartera (barra superior) | Visible en todas las pantallas: dinero total en tus cuentas y detalle por cartera. Se actualiza sola al guardar cualquier cambio. |
+| Resumen | Totales del año, gráficas mensuales (ingresos vs gastos, salidas apiladas, flujo neto), gastos por categoría, Mi dinero por banco, tarjetas, préstamos y metas, hábitos del mes. |
+| Mi dinero | Tus carteras y cuentas (nómina, ahorro, inversión, efectivo) por banco, saldos automáticos, transferencias, ajustes de saldo y gráficas por banco y por mes. |
+| Movimientos | Ingresos y gastos con categoría, fecha, descripción y forma de pago (cartera o tarjeta de crédito, con compras a meses). Filtros por mes/año, tipo, categoría, cuenta y búsqueda. |
+| Tarjetas | Tarjetas de crédito con límite, corte y fecha de pago. Deuda, pago del mes sin intereses, compras a meses (qué mensualidad toca y cuánto falta), pagos desde una cartera. |
 | Préstamos | Préstamos con tasa anual, pago mensual y plazo. Saldo restante con intereses mensuales, avance, pagos registrados y tabla de amortización. |
-| Ahorros | Metas con monto objetivo y fecha límite. Aportes y retiros, aporte mensual sugerido, gráfica de ahorro por mes. |
+| Metas | Metas con monto objetivo y fecha límite. Aportes y retiros, aporte mensual sugerido, gráfica de ahorro por mes. |
 | Presupuestos | Límite mensual por categoría de gasto comparado con lo gastado. Copia del mes anterior. |
 | Categorías | Personaliza nombre, color e icono de las categorías de ingreso y gasto. |
 
@@ -25,7 +27,9 @@ Aplicación web de finanzas personales para crear hábitos: registra ingresos y 
 - Los **pagos a tarjetas** no cuentan como gasto (ya se contó la compra); solo reducen la deuda de la tarjeta.
 - Los **pagos a préstamos** cuentan como salida, separados de los gastos.
 - Los **aportes a metas** cuentan como ahorro.
-- **Disponible del mes** = ingresos − gastos − préstamos − ahorro. **Tasa de ahorro** = ahorro / ingresos.
+- El **saldo de cada cartera** = saldo inicial + ingresos − gastos pagados con ella − pagos de tarjeta y préstamo hechos con ella ± transferencias ± ajustes.
+- Las **compras a meses** cuentan como gasto completo el día de la compra; la primera mensualidad se paga el mes siguiente.
+- **Flujo neto del mes** = ingresos − gastos − préstamos − ahorro. **Tasa de ahorro** = ahorro / ingresos.
 
 ## Variables de entorno
 
@@ -91,7 +95,9 @@ npm start              # sirve dist/client desde Express en :3000
 
 ```
 server/          Express + rutas de la API (/api/...)
-  routes/        categories, transactions, cards, loans, goals, budgets, dashboard
+  routes/        categories, transactions, cards, loans, goals, budgets, dashboard, accounts
+  accountsData.ts  saldos de carteras (fórmula única)
+  installments.ts  compras a meses (fórmula única)
   schema.ts      DDL idempotente + categorías por defecto
 client/          Vite (index.html, src/)
   src/views/     una vista por sección

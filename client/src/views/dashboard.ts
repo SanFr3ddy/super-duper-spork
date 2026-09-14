@@ -1,5 +1,6 @@
 /**
  * Vista "Resumen": dashboard anual con gráficas por mes, mes actual, hábitos y accesos a las secciones.
+ * "Flujo neto" = ingresos − gastos − préstamos − ahorro. "Disponible" = dinero en cuentas (Mi dinero).
  */
 import type { CategoryTotal, DashboardYear, Transaction } from '../../../shared/types';
 import { api, qs } from '../api';
@@ -38,6 +39,19 @@ const STYLE = `<style>
 .v-dash .card-head a.btn{text-decoration:none}
 .v-dash .row-gap{margin-top:16px}
 .v-dash .cat-empty{padding:18px 0}
+.v-dash .money-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr);gap:18px 28px;align-items:start}
+.v-dash .money-main{display:flex;flex-direction:column;gap:12px;min-width:0}
+.v-dash .money-total{font-size:1.9rem;font-weight:800;letter-spacing:-.02em;line-height:1.1;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.v-dash .money-split{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.v-dash .money-split>div{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;min-width:0}
+.v-dash .money-split .val{font-weight:700;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;margin-top:2px}
+.v-dash .money-banks{display:flex;flex-direction:column;gap:12px;min-width:0}
+.v-dash .money-bank{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:baseline;gap:4px 10px}
+.v-dash .money-bank .bank{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.v-dash .money-bank .share{color:var(--muted);font-size:.8rem;min-width:40px;text-align:right}
+.v-dash .money-bank .progress{grid-column:1/-1}
+.v-dash .money-empty{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px}
+@media (max-width:820px){.v-dash .money-layout{grid-template-columns:1fr}}
 </style>`;
 
 // ---------------------------------------------------------------------------
@@ -149,8 +163,10 @@ function draw(root: HTMLElement, d: DashboardYear): void {
       ${statTile('Ingresos del año', money(d.totals.income), 'white', `${d.income_by_category.length} categorías de ingreso`)}
       ${statTile('Gastos del año', money(d.totals.expenses), 'red', `Promedio mensual: ${money(d.totals.avg_monthly_expenses)}`)}
       ${statTile('Ahorro del año', money(d.totals.savings), '', `Tasa de ahorro ${pct(d.totals.savings_rate)}`)}
-      ${statTile('Disponible del año', money(d.totals.net), netCls, bestWorst)}
+      ${statTile('Flujo neto del año', money(d.totals.net), netCls, bestWorst)}
     </div>
+
+    ${moneyCard(d)}
 
     <div class="grid grid-2 row-gap">
       <div class="card">
@@ -196,8 +212,8 @@ function draw(root: HTMLElement, d: DashboardYear): void {
         ])}
       </div>
       <div class="card">
-        <div class="card-head"><h2>Disponible por mes</h2><span class="sub">Ingresos − gastos − préstamos − ahorro</span></div>
-        <div class="chart-box"><canvas data-chart="net" aria-label="Disponible por mes"></canvas></div>
+        <div class="card-head"><h2>Flujo neto por mes</h2><span class="sub">Ingresos − gastos − préstamos − ahorro</span></div>
+        <div class="chart-box"><canvas data-chart="net" aria-label="Flujo neto por mes"></canvas></div>
       </div>
     </div>
 
@@ -247,7 +263,7 @@ function draw(root: HTMLElement, d: DashboardYear): void {
     const cy = currentYear();
     const lastMonth = d.year < cy ? 12 : d.year === cy ? d.current_month.month : 0;
     const netData = d.months.map((m) => (m.month <= lastMonth ? m.net : null));
-    charts.push(monthlyLines(net, [{ label: 'Disponible', data: netData, color: COLORS.net }], { fill: true, zeroLine: true }));
+    charts.push(monthlyLines(net, [{ label: 'Flujo neto', data: netData, color: COLORS.net }], { fill: true, zeroLine: true }));
   }
   mountCatChart(wrap);
 
@@ -289,7 +305,7 @@ function monthKv(d: DashboardYear): string {
     ${row('Gastos', money(cm.expenses), 'red')}
     ${row('Préstamos', money(cm.loan_payments))}
     ${row('Ahorro', money(cm.savings))}
-    ${row('Disponible', money(cm.net), cm.net < 0 ? 'red' : 'white', true)}
+    ${row('Flujo neto', money(cm.net), cm.net < 0 ? 'red' : 'white', true)}
   </dl>`;
 }
 
@@ -326,6 +342,13 @@ function habitsHtml(d: DashboardYear): string {
     }
   }
   if (isCurrentYear) {
+    const m = d.money;
+    if (m.accounts_count > 0 && cm.expenses > 0 && m.disponible < cm.expenses) {
+      items.push({ icon: '🏦', text: `Tu dinero disponible (${money(m.disponible)}) es menor que tus gastos de este mes.` });
+    }
+    if (d.cards.installments_due_this_month > 0) {
+      items.push({ icon: '🗓️', text: `Este mes pagas ${money(d.cards.installments_due_this_month)} de compras a meses.` });
+    }
     if (d.cards.utilization > 0.3) {
       items.push({ icon: '💳', text: `Tu utilización de crédito es ${pct(d.cards.utilization)}; procura mantenerla bajo 30%.` });
     }
@@ -422,6 +445,12 @@ function cardsSummary(d: DashboardYear): string {
     ${progressBar(c.utilization)}
     <div class="row between small muted"><span>Utilización ${esc(pct(c.utilization))}</span><span>Límite ${esc(money(c.total_limit))}</span></div>
     ${npHtml}
+    <span class="small"><span class="muted">Paga este mes sin intereses:</span> <span class="num ${c.pay_this_month > 0 ? 'red' : 'white'}">${esc(money(c.pay_this_month))}</span></span>
+    ${
+      c.installments_due_this_month > 0
+        ? `<span class="small"><span class="muted">Mensualidades este mes:</span> <span class="num">${esc(money(c.installments_due_this_month))}</span></span>`
+        : ''
+    }
     <span class="muted small">${c.count} ${c.count === 1 ? 'tarjeta' : 'tarjetas'}</span>
   </div>`;
 }
@@ -456,6 +485,64 @@ function goalsSummary(d: DashboardYear): string {
   </div>`;
 }
 
+/** Origen del movimiento: tarjeta (con "N MSI" si es a meses) o cuenta ("🏦 Banco · Cuenta"). */
+function sourceLabel(t: Transaction): string {
+  if (t.card_name) return t.installments > 1 ? `💳 ${t.card_name} · ${t.installments} MSI` : `💳 ${t.card_name}`;
+  if (t.account_name) return t.account_bank ? `🏦 ${t.account_bank} · ${t.account_name}` : `🏦 ${t.account_name}`;
+  return '';
+}
+
+function moneyCard(d: DashboardYear): string {
+  const m = d.money;
+  const head = `<div class="card-head"><h2>💰 Mi dinero <span class="sub">saldo a hoy</span></h2><a class="btn ghost sm" href="#/dinero">Ver →</a></div>`;
+  if (m.accounts_count === 0) {
+    return `<div class="card row-gap">
+      ${head}
+      <div class="money-empty">
+        <div>
+          <p class="bold white">Aún no registras tus cuentas</p>
+          <p class="muted small">Agrega tus cuentas de banco y tu efectivo para saber cuánto dinero tienes y en qué banco está.</p>
+        </div>
+        <a class="btn primary" href="#/dinero">Agregar cuentas</a>
+      </div>
+    </div>`;
+  }
+  const banks = m.by_bank.slice(0, 5);
+  const banksHtml =
+    banks.length === 0
+      ? '<p class="muted small">Sin saldos por banco.</p>'
+      : banks
+          .map(
+            (b) => `<div class="money-bank">
+            <span class="bank" title="${esc(b.bank)}">${esc(b.bank)}</span>
+            <span class="amt ${b.total < 0 ? 'red' : ''}">${esc(money(b.total))}</span>
+            <span class="share num">${esc(pct(b.share))}</span>
+            ${progressBar(b.share, { white: true })}
+          </div>`,
+          )
+          .join('');
+  return `<div class="card row-gap">
+    ${head}
+    <div class="money-layout">
+      <div class="money-main">
+        <div>
+          <div class="stat-label">Total en cuentas</div>
+          <div class="money-total ${m.total < 0 ? 'red' : 'white'}">${esc(money(m.total))}</div>
+          <div class="muted small">${m.accounts_count} ${m.accounts_count === 1 ? 'cuenta' : 'cuentas'}</div>
+        </div>
+        <div class="money-split">
+          <div><div class="stat-label">Disponible</div><div class="val ${m.disponible < 0 ? 'red' : 'white'}">${esc(money(m.disponible))}</div></div>
+          <div><div class="stat-label">Guardado</div><div class="val ${m.guardado < 0 ? 'red' : ''}">${esc(money(m.guardado))}</div></div>
+        </div>
+      </div>
+      <div class="money-banks">
+        <div class="stat-label">Por banco</div>
+        ${banksHtml}
+      </div>
+    </div>
+  </div>`;
+}
+
 function recentHtml(items: Transaction[]): string {
   if (items.length === 0) {
     return emptyState('🧾', 'Sin movimientos', 'Registra tu primer ingreso o gasto.', '<a class="btn primary" href="#/movimientos">+ Nuevo movimiento</a>');
@@ -466,7 +553,7 @@ function recentHtml(items: Transaction[]): string {
         const isIncome = t.type === 'income';
         const icon = t.category_icon || (isIncome ? '💰' : '💸');
         const title = t.description || t.category_name || (isIncome ? 'Ingreso' : 'Gasto');
-        const meta = [fmtDateShort(t.date), t.category_name ?? 'Sin categoría', t.card_name ? `💳 ${t.card_name}` : ''].filter(Boolean).join(' · ');
+        const meta = [fmtDateShort(t.date), t.category_name ?? 'Sin categoría', sourceLabel(t)].filter(Boolean).join(' · ');
         return `<div class="list-item">
           <div class="icon-box">${esc(icon)}</div>
           <div class="grow"><div class="name">${esc(title)}</div><div class="meta">${esc(meta)}</div></div>

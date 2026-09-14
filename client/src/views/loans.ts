@@ -2,7 +2,7 @@
  * Vista "Préstamos": resumen de deudas, pagos por mes, tarjeta por préstamo,
  * historial de pagos y tabla de amortización teórica.
  */
-import type { Loan, LoanInput, LoanPayment, LoanScheduleRow } from '../../../shared/types';
+import type { Account, Loan, LoanInput, LoanPayment, LoanPaymentInput, LoanScheduleRow } from '../../../shared/types';
 import { api, ApiError } from '../api';
 import { esc, money, num, pct, fmtDate, todayISO, currentYear } from '../format';
 import {
@@ -14,6 +14,7 @@ import {
   field,
   input,
   moneyInput,
+  select,
   emptyState,
   loadingState,
   progressBar,
@@ -36,9 +37,37 @@ const STYLE = `<style>
   .v-loans-modal .v-loan-summary { margin-bottom: 14px; }
 </style>`;
 
+/** Última cuenta usada para pagar un préstamo (preferencia local del navegador). */
+const LAST_ACCOUNT_KEY = 'finanzas.loans.lastAccountId';
+
+function readLastAccount(): string {
+  try {
+    return localStorage.getItem(LAST_ACCOUNT_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function saveLastAccount(value: string): void {
+  try {
+    if (value) localStorage.setItem(LAST_ACCOUNT_KEY, value);
+    else localStorage.removeItem(LAST_ACCOUNT_KEY);
+  } catch {
+    /* almacenamiento no disponible */
+  }
+}
+
+function accountLabel(a: Pick<Account, 'name' | 'bank'>): string {
+  return a.bank ? `${a.bank} · ${a.name}` : a.name;
+}
+
 let view: HTMLElement | null = null;
 let chartCanvas: HTMLCanvasElement | null = null;
 let loans: Loan[] = [];
+/** Se incrementa en cada carga y en destroy(); una respuesta vieja no pinta sobre una más nueva. */
+let loadSeq = 0;
+/** Evita abrir dos formularios de pago si se pulsa dos veces mientras cargan las cuentas. */
+let payFormPending = false;
 
 // ---------------------------------------------------------------------------
 // Ciclo de vida
@@ -65,6 +94,7 @@ export async function render(root: HTMLElement): Promise<void> {
 }
 
 export function destroy(): void {
+  loadSeq++;
   destroyChart(chartCanvas);
   chartCanvas = null;
   view = null;
@@ -77,17 +107,20 @@ export function destroy(): void {
 async function load(): Promise<void> {
   const el = view;
   if (!el) return;
+  const seq = ++loadSeq;
   destroyChart(chartCanvas);
   chartCanvas = null;
   el.innerHTML = STYLE + loadingState();
   try {
     const items = await api.get<Loan[]>('/api/loans');
     const lists = await Promise.all(items.map((l) => api.get<LoanPayment[]>(`/api/loans/${l.id}/payments`)));
-    if (view !== el) return; // la vista cambió mientras cargaba
+    if (view !== el || seq !== loadSeq) return; // la vista cambió o hay una carga más reciente
+    destroyChart(chartCanvas);
+    chartCanvas = null;
     loans = items;
     paint(el, items, lists.flat());
   } catch (err) {
-    if (view !== el) return;
+    if (view !== el || seq !== loadSeq) return;
     showError(err);
     el.innerHTML =
       STYLE +
@@ -238,7 +271,7 @@ async function handleAction(action: string, id: number): Promise<void> {
   if (!loan) return;
   switch (action) {
     case 'pay':
-      openPaymentForm(loan);
+      await openPaymentForm(loan);
       break;
     case 'history':
       await openHistory(loan);
@@ -298,7 +331,26 @@ function openLoanForm(loan?: Loan): void {
   });
 }
 
-function openPaymentForm(loan: Loan): void {
+async function openPaymentForm(loan: Loan): Promise<void> {
+  if (payFormPending) return;
+  // Cuentas para el select; si fallan, se puede registrar el pago sin cuenta.
+  const el = view;
+  let accounts: Account[] = [];
+  payFormPending = true;
+  try {
+    accounts = (await api.get<Account[]>('/api/accounts/list')).filter((a) => !a.archived);
+  } catch (err) {
+    showError(err, 'No se pudieron cargar tus cuentas');
+  } finally {
+    payFormPending = false;
+  }
+  if (!el || view !== el) return; // la vista cambió mientras cargaban las cuentas
+  const last = readLastAccount();
+  const accountOptions = [
+    { value: '', label: 'Sin especificar', selected: !accounts.some((a) => String(a.id) === last) },
+    ...accounts.map((a) => ({ value: a.id, label: `${accountLabel(a)} (${money(a.balance)})`, selected: String(a.id) === last })),
+  ];
+
   let suggested: number | null;
   if (loan.remaining > 0) suggested = loan.monthly_payment > 0 ? Math.min(loan.monthly_payment, loan.remaining) : loan.remaining;
   else suggested = loan.monthly_payment > 0 ? loan.monthly_payment : null;
@@ -317,14 +369,23 @@ function openPaymentForm(loan: Loan): void {
         ${field('Monto', moneyInput('amount', suggested))}
         ${field('Fecha', input('date', { type: 'date', value: todayISO(), required: true }))}
       </div>
+      ${field(
+        '¿Con qué cuenta pagaste?',
+        select('account_id', accountOptions),
+        accounts.length ? 'El pago se descuenta del saldo de esa cuenta en Mi dinero' : 'Registra tus cuentas en Mi dinero para descontar el pago de su saldo',
+      )}
       ${field('Nota (opcional)', input('note', { placeholder: 'Ej. Mensualidad de septiembre' }))}
     </form>`,
     onSubmit: async (v, _form, modal) => {
-      await api.post<LoanPayment>(`/api/loans/${loan.id}/payments`, {
+      const accountRaw = v.account_id ?? '';
+      const body: LoanPaymentInput = {
         amount: toNumber(v.amount ?? '', 'monto'),
         date: v.date ?? '',
         note: (v.note ?? '').trim(),
-      });
+        account_id: accountRaw ? Number(accountRaw) : null,
+      };
+      await api.post<LoanPayment>(`/api/loans/${loan.id}/payments`, body);
+      saveLastAccount(accountRaw);
       modal.close();
       toast('Pago registrado');
       await load();
@@ -345,11 +406,12 @@ async function openHistory(loan: Loan): Promise<void> {
       }
       const total = payments.reduce((a, p) => a + p.amount, 0);
       box.innerHTML = `<div class="table-wrap"><table>
-        <thead><tr><th>Fecha</th><th>Nota</th><th class="amount">Monto</th><th></th></tr></thead>
+        <thead><tr><th>Fecha</th><th>Cuenta</th><th>Nota</th><th class="amount">Monto</th><th></th></tr></thead>
         <tbody>${payments
           .map(
             (p) => `<tr>
               <td class="nowrap">${fmtDate(p.date)}</td>
+              <td>${p.account_name ? esc(p.account_name) : '<span class="muted">Sin especificar</span>'}</td>
               <td>${p.note ? esc(p.note) : '<span class="muted">—</span>'}</td>
               <td class="amount num">${money(p.amount)}</td>
               <td class="actions"><button type="button" class="btn ghost sm icon" data-del="${p.id}" aria-label="Eliminar pago" title="Eliminar pago">✕</button></td>
@@ -357,7 +419,7 @@ async function openHistory(loan: Loan): Promise<void> {
           )
           .join('')}</tbody>
         <tfoot><tr>
-          <td colspan="2" class="muted small">${payments.length === 1 ? '1 pago' : `${payments.length} pagos`}</td>
+          <td colspan="3" class="muted small">${payments.length === 1 ? '1 pago' : `${payments.length} pagos`}</td>
           <td class="amount num white">${money(total)}</td>
           <td></td>
         </tr></tfoot>

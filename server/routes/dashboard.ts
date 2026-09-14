@@ -2,6 +2,8 @@ import { Router } from 'express';
 import { query } from '../db.js';
 import { HttpError, monthRange, round2, todayISO } from '../util.js';
 import { loanStatus, type LoanPaymentLite } from '../loanMath.js';
+import { accountTotals, bankTotals, loadAccounts } from '../accountsData.js';
+import { currentYM, loadPlanSources, totalsByCard } from '../installments.js';
 import type { CategoryTotal, DashboardYear, MonthSummary, Transaction, TxType } from '../../shared/types.js';
 
 /**
@@ -11,7 +13,9 @@ import type { CategoryTotal, DashboardYear, MonthSummary, Transaction, TxType } 
  *  - Ingresos/Gastos: transactions.type
  *  - Pagos de tarjeta: informativos (no restan)
  *  - Pagos de préstamo y aportes a metas: salidas separadas
- *  - net = income - expenses - loan_payments - savings
+ *  - net = income - expenses - loan_payments - savings  (flujo neto)
+ *  - money: saldos de cuentas a hoy (server/accountsData.ts)
+ *  - cards.*installments*: compras a meses del mes actual (server/installments.ts)
  */
 export const dashboardRouter = Router();
 
@@ -129,7 +133,7 @@ dashboardRouter.get('/', async (req, res) => {
   const cmMonth = year === curYear ? curMonth : 12;
   const cm = monthRange(cmYear, cmMonth);
 
-  const [txRows, cardPayRows, loanPayRows, goalContribRows, expensesByCategory, incomeByCategory, cmExpensesByCategory, budgetRow, cardRows, loanRows, loanPaymentRows, goalRows, recentRows, yearRows] =
+  const [txRows, cardPayRows, loanPayRows, goalContribRows, expensesByCategory, incomeByCategory, cmExpensesByCategory, budgetRow, cardRows, loanRows, loanPaymentRows, goalRows, recentRows, yearRows, accounts, planSources] =
     await Promise.all([
       query<TxMonthRow>(
         `SELECT EXTRACT(MONTH FROM date)::int AS m,
@@ -188,10 +192,12 @@ dashboardRouter.get('/', async (req, res) => {
       query<RecentRow>(
         `SELECT t.id, t.type, t.amount, t.category_id,
                 c.name AS category_name, c.color AS category_color, c.icon AS category_icon,
-                t.description, t.date, t.credit_card_id, cc.name AS card_name, t.created_at
+                t.description, t.date, t.credit_card_id, cc.name AS card_name,
+                t.account_id, a.name AS account_name, a.bank AS account_bank, t.installments, t.created_at
            FROM transactions t
            LEFT JOIN categories c ON c.id = t.category_id
            LEFT JOIN credit_cards cc ON cc.id = t.credit_card_id
+           LEFT JOIN accounts a ON a.id = t.account_id
           ORDER BY t.date DESC, t.id DESC
           LIMIT 8`,
       ),
@@ -203,6 +209,8 @@ dashboardRouter.get('/', async (req, res) => {
            UNION SELECT DISTINCT EXTRACT(YEAR FROM date)::int FROM goal_contributions
          ) u ORDER BY y DESC`,
       ),
+      loadAccounts(),
+      loadPlanSources(),
     ]);
 
   // --- Meses (siempre 12) ---
@@ -264,12 +272,20 @@ dashboardRouter.get('/', async (req, res) => {
   const budget = budgetRow[0];
   const budgetOut = budget && num(budget.n) > 0 ? { budgeted: round2(num(budget.budgeted)), spent: round2(num(budget.spent)) } : null;
 
-  // --- Tarjetas ---
+  // --- Tarjetas (compras a meses respecto al mes actual, server/installments.ts) ---
+  const installmentsByCard = totalsByCard(planSources, currentYM());
   let totalDebt = 0;
   let totalLimit = 0;
+  let installmentsDue = 0;
+  let deferredRemaining = 0;
+  let payThisMonth = 0;
   let nextPayment: DashboardYear['cards']['next_payment'] = null;
   for (const c of cardRows) {
     const balance = round2(Math.max(0, num(c.charged) - num(c.paid)));
+    const inst = installmentsByCard.get(c.id);
+    installmentsDue += inst?.installments_due_this_month ?? 0;
+    deferredRemaining += inst?.deferred_remaining ?? 0;
+    payThisMonth += Math.max(0, balance - (inst?.deferred_remaining ?? 0));
     totalDebt += balance;
     totalLimit += num(c.credit_limit);
     if (balance > 0) {
@@ -281,6 +297,9 @@ dashboardRouter.get('/', async (req, res) => {
   }
   totalDebt = round2(totalDebt);
   totalLimit = round2(totalLimit);
+
+  // --- Mi dinero (saldos a hoy, cuentas no archivadas) ---
+  const accTotals = accountTotals(accounts);
 
   // --- Préstamos ---
   let totalRemaining = 0;
@@ -327,6 +346,10 @@ dashboardRouter.get('/', async (req, res) => {
     date: String(r.date),
     credit_card_id: r.credit_card_id ?? null,
     card_name: r.card_name ?? null,
+    account_id: r.account_id ?? null,
+    account_name: r.account_name ?? null,
+    account_bank: r.account_name != null ? (r.account_bank ?? '') : null,
+    installments: Math.max(1, num(r.installments) || 1),
     created_at: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
   }));
 
@@ -372,6 +395,9 @@ dashboardRouter.get('/', async (req, res) => {
       total_limit: totalLimit,
       utilization: totalLimit > 0 ? round4(totalDebt / totalLimit) : 0,
       next_payment: nextPayment,
+      installments_due_this_month: round2(installmentsDue),
+      deferred_remaining: round2(deferredRemaining),
+      pay_this_month: round2(payThisMonth),
     },
     loans: {
       count: loanRows.length,
@@ -384,6 +410,13 @@ dashboardRouter.get('/', async (req, res) => {
       total_saved: totalSaved,
       total_target: totalTarget,
       progress: totalTarget > 0 ? round4(totalSaved / totalTarget) : 0,
+    },
+    money: {
+      total: accTotals.total,
+      disponible: accTotals.disponible,
+      guardado: accTotals.guardado,
+      accounts_count: accTotals.accounts,
+      by_bank: bankTotals(accounts).slice(0, 5),
     },
     recent,
     available_years: availableYears,

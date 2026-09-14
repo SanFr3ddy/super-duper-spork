@@ -9,6 +9,7 @@ export const transactionsRouter = Router();
 type TxRow = Transaction & Row;
 
 const zOptId = z.number().int().positive().nullable().optional();
+const zInstallments = z.number().int('Meses: debe ser un número entero').min(1, 'Meses: mínimo 1').max(48, 'Meses: máximo 48');
 const txSchema = z.object({
   type: zTxType,
   amount: zMoney,
@@ -16,15 +17,19 @@ const txSchema = z.object({
   description: zNote.default(''),
   category_id: zOptId,
   credit_card_id: zOptId,
+  account_id: zOptId,
+  installments: zInstallments.optional(),
 });
 const txPartial = txSchema.partial();
 
 const TX_FROM = `FROM transactions t
   LEFT JOIN categories c ON c.id = t.category_id
-  LEFT JOIN credit_cards cc ON cc.id = t.credit_card_id`;
+  LEFT JOIN credit_cards cc ON cc.id = t.credit_card_id
+  LEFT JOIN accounts a ON a.id = t.account_id`;
 const TX_SELECT = `SELECT t.id, t.type, t.amount, t.category_id,
     c.name AS category_name, c.color AS category_color, c.icon AS category_icon,
-    t.description, t.date, t.credit_card_id, cc.name AS card_name, t.created_at
+    t.description, t.date, t.credit_card_id, cc.name AS card_name,
+    t.account_id, a.name AS account_name, a.bank AS account_bank, t.installments, t.created_at
   ${TX_FROM}`;
 
 interface TxValues {
@@ -34,6 +39,8 @@ interface TxValues {
   description: string;
   category_id: number | null;
   credit_card_id: number | null;
+  account_id: number | null;
+  installments: number;
 }
 
 function qstr(v: unknown): string {
@@ -51,10 +58,21 @@ async function fetchTx(id: number): Promise<Transaction> {
   return row;
 }
 
-/** Aplica las reglas de coherencia y verifica referencias. Devuelve los valores definitivos. */
+/**
+ * Aplica las reglas de coherencia y verifica referencias. Devuelve los valores definitivos.
+ *  - Ingreso: sin tarjeta y en una sola exhibición.
+ *  - Gasto con tarjeta: no sale de una cuenta (account_id = null).
+ *  - Sin tarjeta: installments = 1.
+ */
 async function normalize(v: TxValues): Promise<TxValues> {
-  const out: TxValues = { ...v };
-  if (out.type === 'income') out.credit_card_id = null;
+  const out: TxValues = { ...v, amount: round2(v.amount) };
+  if (out.type === 'income') {
+    out.credit_card_id = null;
+    out.installments = 1;
+  }
+  if (out.credit_card_id !== null) out.account_id = null;
+  else out.installments = 1;
+
   if (out.category_id !== null) {
     const cat = await one<{ type: TxType }>('SELECT type FROM categories WHERE id = $1', [out.category_id]);
     if (!cat) throw new HttpError(400, 'La categoría no existe');
@@ -64,10 +82,14 @@ async function normalize(v: TxValues): Promise<TxValues> {
     const card = await one<{ id: number }>('SELECT id FROM credit_cards WHERE id = $1', [out.credit_card_id]);
     if (!card) throw new HttpError(400, 'La tarjeta de crédito no existe');
   }
+  if (out.account_id !== null) {
+    const acc = await one<{ id: number }>('SELECT id FROM accounts WHERE id = $1', [out.account_id]);
+    if (!acc) throw new HttpError(400, 'La cuenta no existe');
+  }
   return out;
 }
 
-// GET /api/transactions?year=&month=&type=&category_id=&credit_card_id=&q=
+// GET /api/transactions?year=&month=&type=&category_id=&credit_card_id=&account_id=&q=
 transactionsRouter.get('/', async (req, res) => {
   const { year, month } = yearMonth(req.query);
   const { from, to } = monthRange(year, month);
@@ -89,6 +111,11 @@ transactionsRouter.get('/', async (req, res) => {
   if (cardId) {
     params.push(parseId(cardId, 'credit_card_id'));
     where.push(`t.credit_card_id = $${params.length}`);
+  }
+  const accountId = qstr(req.query.account_id);
+  if (accountId) {
+    params.push(parseId(accountId, 'account_id'));
+    where.push(`t.account_id = $${params.length}`);
   }
   const q = qstr(req.query.q).trim();
   if (q) {
@@ -122,16 +149,18 @@ transactionsRouter.post('/', async (req, res) => {
     description: data.description,
     category_id: data.category_id ?? null,
     credit_card_id: data.credit_card_id ?? null,
+    account_id: data.account_id ?? null,
+    installments: data.installments ?? 1,
   });
   const row = await one<{ id: number }>(
-    `INSERT INTO transactions (type, amount, category_id, description, date, credit_card_id)
-     VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-    [v.type, v.amount, v.category_id, v.description, v.date, v.credit_card_id],
+    `INSERT INTO transactions (type, amount, category_id, description, date, credit_card_id, account_id, installments)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+    [v.type, v.amount, v.category_id, v.description, v.date, v.credit_card_id, v.account_id, v.installments],
   );
   res.status(201).json(await fetchTx(row!.id));
 });
 
-// PUT /api/transactions/:id
+// PUT /api/transactions/:id  (los campos omitidos conservan su valor; luego se aplican las mismas reglas)
 transactionsRouter.put('/:id', async (req, res) => {
   const id = parseId(req.params.id);
   const data = validate(txPartial, req.body);
@@ -143,12 +172,15 @@ transactionsRouter.put('/:id', async (req, res) => {
     description: data.description ?? existing.description,
     category_id: data.category_id === undefined ? existing.category_id : data.category_id,
     credit_card_id: data.credit_card_id === undefined ? existing.credit_card_id : data.credit_card_id,
+    account_id: data.account_id === undefined ? existing.account_id : data.account_id,
+    installments: data.installments ?? (Number(existing.installments) || 1),
   });
   await query(
     `UPDATE transactions
-     SET type = $1, amount = $2, category_id = $3, description = $4, date = $5, credit_card_id = $6
-     WHERE id = $7`,
-    [v.type, v.amount, v.category_id, v.description, v.date, v.credit_card_id, id],
+     SET type = $1, amount = $2, category_id = $3, description = $4, date = $5, credit_card_id = $6,
+         account_id = $7, installments = $8
+     WHERE id = $9`,
+    [v.type, v.amount, v.category_id, v.description, v.date, v.credit_card_id, v.account_id, v.installments, id],
   );
   res.json(await fetchTx(id));
 });

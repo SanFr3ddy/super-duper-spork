@@ -29,6 +29,7 @@ const paymentSchema = z.object({
   amount: zMoney,
   date: zDate,
   note: zNote.optional(),
+  account_id: z.number().int('Cuenta inválida').positive('Cuenta inválida').nullable().optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -130,6 +131,8 @@ type PaymentRow = {
   amount: number;
   date: string;
   note: string;
+  account_id: number | null;
+  account_name: string | null;
   created_at: Date | string;
 };
 const toPayment = (r: PaymentRow): LoanPayment => ({
@@ -138,8 +141,15 @@ const toPayment = (r: PaymentRow): LoanPayment => ({
   amount: Number(r.amount) || 0,
   date: r.date,
   note: r.note ?? '',
+  account_id: r.account_id ?? null,
+  account_name: r.account_name ?? null,
   created_at: toIso(r.created_at),
 });
+
+const PAYMENT_SELECT = `
+  SELECT p.id, p.loan_id, p.amount, p.date, p.note, p.account_id, a.name AS account_name, p.created_at
+    FROM loan_payments p
+    LEFT JOIN accounts a ON a.id = p.account_id`;
 
 // ---------------------------------------------------------------------------
 // Rutas: préstamos
@@ -190,10 +200,7 @@ loansRouter.delete('/:id', async (req, res) => {
 loansRouter.get('/:id/payments', async (req, res) => {
   const id = parseId(req.params.id);
   await assertLoanExists(id);
-  const rows = await query<PaymentRow>(
-    'SELECT id, loan_id, amount, date, note, created_at FROM loan_payments WHERE loan_id = $1 ORDER BY date DESC, id DESC',
-    [id],
-  );
+  const rows = await query<PaymentRow>(`${PAYMENT_SELECT} WHERE p.loan_id = $1 ORDER BY p.date DESC, p.id DESC`, [id]);
   res.json(rows.map(toPayment));
 });
 
@@ -201,11 +208,16 @@ loansRouter.post('/:id/payments', async (req, res) => {
   const id = parseId(req.params.id);
   await assertLoanExists(id);
   const data = validate(paymentSchema, req.body);
-  const row = await one<PaymentRow>(
-    `INSERT INTO loan_payments (loan_id, amount, date, note) VALUES ($1, $2, $3, $4)
-     RETURNING id, loan_id, amount, date, note, created_at`,
-    [id, data.amount, data.date, data.note ?? ''],
+  const accountId = data.account_id ?? null;
+  if (accountId !== null) {
+    const acc = await one<{ id: number }>('SELECT id FROM accounts WHERE id = $1', [accountId]);
+    if (!acc) throw new HttpError(400, 'La cuenta seleccionada no existe');
+  }
+  const inserted = await one<{ id: number }>(
+    'INSERT INTO loan_payments (loan_id, amount, date, note, account_id) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+    [id, round2(data.amount), data.date, data.note ?? '', accountId],
   );
+  const row = await one<PaymentRow>(`${PAYMENT_SELECT} WHERE p.id = $1`, [inserted!.id]);
   res.status(201).json(toPayment(row!));
 });
 

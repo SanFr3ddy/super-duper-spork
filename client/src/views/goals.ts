@@ -43,6 +43,7 @@ const STYLE = `<style>
   .v-goals .v-goal .kv { margin: 2px 0 0; }
   .v-goals .v-goal-actions { margin-top: auto; padding-top: 6px; }
   .v-goals .stat .progress { margin-top: 4px; }
+  .v-goals .tip a { color: var(--white); font-weight: 600; text-decoration: underline; text-underline-offset: 2px; }
   .v-goals-check { display: inline-flex; align-items: center; gap: 8px; color: var(--text-2); font-size: 0.9rem; cursor: pointer; user-select: none; }
   .v-goals-check input { width: 16px; height: 16px; margin: 0; accent-color: var(--red); cursor: pointer; }
 </style>`;
@@ -149,7 +150,7 @@ function paint(): void {
       <div data-chart>${loadingState()}</div>
     </div>
 
-    <div class="tip">Los aportes a tus metas se cuentan como Ahorro en el resumen mensual y se restan de tu disponible.</div>
+    <div class="tip">Tus metas son objetivos de ahorro. Tu dinero real, y en qué banco está, lo ves en <a href="#/dinero">Mi dinero</a>. Los aportes a tus metas siguen contando como Ahorro en el resumen mensual.</div>
 
     ${
       goals.length

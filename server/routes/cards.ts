@@ -6,11 +6,14 @@
  *  - paid_total / paid_this_month: card_payments de la tarjeta.
  *  - balance = max(0, charged_total - paid_total); utilization = balance / credit_limit (0 si no hay límite).
  *  - next_cutoff_date / next_payment_date: próxima ocurrencia del día de corte / pago a partir de hoy.
+ *  - active_plans / installments_due_this_month / deferred_remaining: compras a meses (server/installments.ts).
+ *  - pay_this_month = max(0, balance - deferred_remaining): pago para no generar intereses.
  */
 import { Router } from 'express';
 import { z } from 'zod';
 import { query, one } from '../db.js';
 import { validate, parseId, HttpError, notFound, monthRange, round2, zDate, zMoney, zMoneyNonNeg, zColor, zName, zNote, todayISO } from '../util.js';
+import { installmentsOverview, loadPlanSources, totalsByCard, type CardInstallmentTotals } from '../installments.js';
 import type { CreditCard, CardPayment, Transaction } from '../../shared/types.js';
 
 export const cardsRouter = Router();
@@ -34,6 +37,12 @@ const paymentSchema = z.object({
   amount: zMoney,
   date: zDate,
   note: zNote.optional(),
+  account_id: z.number().int('La cuenta debe ser un id entero').positive('La cuenta debe ser un id positivo').nullable().optional(),
+});
+
+const installmentsQuerySchema = z.object({
+  year: z.number({ invalid_type_error: 'Debe ser un número' }).int('Debe ser un entero').min(2000, 'Mínimo 2000').max(2100, 'Máximo 2100'),
+  month: z.number({ invalid_type_error: 'Debe ser un número' }).int('Debe ser un entero').min(1, 'Mínimo 1').max(12, 'Máximo 12'),
 });
 
 // ---------------------------------------------------------------------------
@@ -110,7 +119,9 @@ const CARDS_SQL = `
    WHERE ($3::int IS NULL OR c.id = $3::int)
    ORDER BY c.name, c.id`;
 
-function toCard(r: CardRow, today: string): CreditCard {
+const NO_PLANS: CardInstallmentTotals = { active_plans: 0, installments_due_this_month: 0, deferred_remaining: 0 };
+
+function toCard(r: CardRow, today: string, plans: CardInstallmentTotals = NO_PLANS): CreditCard {
   const credit_limit = round2(Number(r.credit_limit) || 0);
   const charged_total = round2(Number(r.charged_total) || 0);
   const paid_total = round2(Number(r.paid_total) || 0);
@@ -133,6 +144,10 @@ function toCard(r: CardRow, today: string): CreditCard {
     last_payment_date: r.last_payment_date ?? null,
     next_cutoff_date: nextDateForDay(r.cutoff_day, today),
     next_payment_date: nextDateForDay(r.payment_day, today),
+    active_plans: plans.active_plans,
+    installments_due_this_month: round2(plans.installments_due_this_month),
+    deferred_remaining: round2(plans.deferred_remaining),
+    pay_this_month: Math.max(0, round2(balance - plans.deferred_remaining)),
   };
 }
 
@@ -140,8 +155,10 @@ async function loadCards(id: number | null): Promise<CreditCard[]> {
   const today = todayISO();
   const [y, m] = today.split('-').map(Number);
   const { from, to } = monthRange(y, m);
-  const rows = await query<CardRow>(CARDS_SQL, [from, to, id]);
-  return rows.map((r) => toCard(r, today));
+  // Dos consultas en paralelo (tarjetas con agregados + compras a meses), sin N+1.
+  const [rows, sources] = await Promise.all([query<CardRow>(CARDS_SQL, [from, to, id]), loadPlanSources(id ?? undefined)]);
+  const plans = totalsByCard(sources, today.slice(0, 7));
+  return rows.map((r) => toCard(r, today, plans.get(r.id)));
 }
 
 /** Devuelve la tarjeta completa (con calculados) o lanza 404. */
@@ -162,6 +179,23 @@ async function ensureCardExists(id: number): Promise<void> {
 cardsRouter.get('/', async (_req, res) => {
   const cards = await loadCards(null);
   res.json(cards);
+});
+
+// ---------------------------------------------------------------------------
+// Compras a meses (antes de las rutas /:id)
+// ---------------------------------------------------------------------------
+function queryNumber(raw: unknown, fallback: number): number {
+  if (raw === undefined || raw === '') return fallback;
+  return Number(Array.isArray(raw) ? raw[0] : raw);
+}
+
+cardsRouter.get('/installments', async (req, res) => {
+  const [ty, tm] = todayISO().split('-').map(Number);
+  const { year, month } = validate(installmentsQuerySchema, {
+    year: queryNumber(req.query.year, ty),
+    month: queryNumber(req.query.month, tm),
+  });
+  res.json(await installmentsOverview(year, month));
 });
 
 cardsRouter.post('/', async (req, res) => {
@@ -216,6 +250,8 @@ type PaymentRow = {
   amount: number;
   date: string;
   note: string;
+  account_id: number | null;
+  account_name: string | null;
   created_at: Date | string;
 };
 
@@ -226,6 +262,8 @@ function toPayment(r: PaymentRow): CardPayment {
     amount: round2(Number(r.amount) || 0),
     date: r.date,
     note: r.note ?? '',
+    account_id: r.account_id ?? null,
+    account_name: r.account_name ?? null,
     created_at: toIso(r.created_at),
   };
 }
@@ -234,9 +272,11 @@ cardsRouter.get('/:id/payments', async (req, res) => {
   const id = parseId(req.params.id);
   await ensureCardExists(id);
   const rows = await query<PaymentRow>(
-    `SELECT id, credit_card_id, amount, date, note, created_at
-       FROM card_payments WHERE credit_card_id = $1
-      ORDER BY date DESC, id DESC`,
+    `SELECT p.id, p.credit_card_id, p.amount, p.date, p.note, p.account_id, a.name AS account_name, p.created_at
+       FROM card_payments p
+       LEFT JOIN accounts a ON a.id = p.account_id
+      WHERE p.credit_card_id = $1
+      ORDER BY p.date DESC, p.id DESC`,
     [id],
   );
   res.json(rows.map(toPayment));
@@ -246,11 +286,20 @@ cardsRouter.post('/:id/payments', async (req, res) => {
   const id = parseId(req.params.id);
   await ensureCardExists(id);
   const data = validate(paymentSchema, req.body);
+  const accountId = data.account_id ?? null;
+  if (accountId !== null) {
+    const acc = await one<{ id: number }>('SELECT id FROM accounts WHERE id = $1', [accountId]);
+    if (!acc) throw new HttpError(400, 'La cuenta no existe');
+  }
   const row = await one<PaymentRow>(
-    `INSERT INTO card_payments (credit_card_id, amount, date, note)
-     VALUES ($1, $2, $3, $4)
-     RETURNING id, credit_card_id, amount, date, note, created_at`,
-    [id, round2(data.amount), data.date, data.note ?? ''],
+    `WITH ins AS (
+       INSERT INTO card_payments (credit_card_id, amount, date, note, account_id)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, credit_card_id, amount, date, note, account_id, created_at
+     )
+     SELECT ins.id, ins.credit_card_id, ins.amount, ins.date, ins.note, ins.account_id, a.name AS account_name, ins.created_at
+       FROM ins LEFT JOIN accounts a ON a.id = ins.account_id`,
+    [id, round2(data.amount), data.date, data.note ?? '', accountId],
   );
   if (!row) throw new HttpError(500, 'No se pudo registrar el pago');
   res.status(201).json(toPayment(row));
@@ -279,6 +328,10 @@ type TxRow = {
   date: string;
   credit_card_id: number | null;
   card_name: string | null;
+  account_id: number | null;
+  account_name: string | null;
+  account_bank: string | null;
+  installments: number;
   created_at: Date | string;
 };
 
@@ -296,10 +349,12 @@ cardsRouter.get('/:id/charges', async (req, res) => {
   const rows = await query<TxRow>(
     `SELECT t.id, t.type, t.amount, t.category_id,
             c.name AS category_name, c.color AS category_color, c.icon AS category_icon,
-            t.description, t.date, t.credit_card_id, cc.name AS card_name, t.created_at
+            t.description, t.date, t.credit_card_id, cc.name AS card_name,
+            t.account_id, a.name AS account_name, a.bank AS account_bank, t.installments, t.created_at
        FROM transactions t
        LEFT JOIN categories c ON c.id = t.category_id
        LEFT JOIN credit_cards cc ON cc.id = t.credit_card_id
+       LEFT JOIN accounts a ON a.id = t.account_id
       WHERE t.credit_card_id = $1 AND t.type = 'expense'
       ORDER BY t.date DESC, t.id DESC
       LIMIT $2`,
@@ -317,6 +372,10 @@ cardsRouter.get('/:id/charges', async (req, res) => {
     date: r.date,
     credit_card_id: r.credit_card_id ?? null,
     card_name: r.card_name ?? null,
+    account_id: r.account_id ?? null,
+    account_name: r.account_name ?? null,
+    account_bank: r.account_bank ?? null,
+    installments: Math.max(1, Number(r.installments) || 1),
     created_at: toIso(r.created_at),
   }));
   res.json(items);
