@@ -40,6 +40,11 @@ export const COLORS = {
   savings: '#cfcfcf',
   loans: '#7a7a7a',
   cards: '#c9192a',
+  // Mi dinero (validado: blanco vs gris ΔE 27.5 normal y CVD, contraste >= 3:1)
+  moneyAvailable: '#f2f2f2',
+  moneySaved: '#9a9a9a',
+  // Compras a meses (una serie)
+  installments: '#e5202e',
   net: '#ffffff',
   muted: '#7f7f7f',
   grid: '#2c2c2a',
