@@ -100,6 +100,15 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
+  const code = (err as { code?: string })?.code;
+  if (code === '28P01') {
+    console.error(
+      '[server] Neon rechazó la contraseña de DATABASE_URL. Copia de nuevo la cadena de conexión desde el panel de Neon ' +
+        '(Connection string) y pégala sin comillas ni espacios en la variable DATABASE_URL. Si reiniciaste la contraseña en Neon, la anterior ya no sirve.',
+    );
+  } else if (code === 'ENOTFOUND') {
+    console.error('[server] No se encontró el host de DATABASE_URL. Revisa que la cadena esté completa (debe terminar en .neon.tech/neondb?sslmode=require).');
+  }
   console.error('[server] no se pudo iniciar:', err);
   process.exit(1);
 });

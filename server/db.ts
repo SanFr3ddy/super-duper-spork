@@ -16,7 +16,13 @@ if (!process.env.DATABASE_URL) {
  * pg trata 'require' como alias de 'verify-full' (y avisa en consola). Lo hacemos explícito para
  * conservar la verificación completa del certificado sin la advertencia. 'channel_binding' no aplica en pg.
  */
-function normalizeUrl(raw: string): string {
+function normalizeUrl(input: string): string {
+  // Tolera errores comunes al pegar en paneles: espacios, saltos de línea, comillas o el prefijo "DATABASE_URL=".
+  const raw = input
+    .trim()
+    .replace(/^DATABASE_URL\s*=\s*/i, '')
+    .replace(/^['"]|['"]$/g, '')
+    .replace(/\s+/g, '');
   try {
     const u = new URL(raw);
     const mode = u.searchParams.get('sslmode');
