@@ -16,6 +16,9 @@ import { goalsRouter } from './routes/goals.js';
 import { budgetsRouter } from './routes/budgets.js';
 import { dashboardRouter } from './routes/dashboard.js';
 import { accountsRouter } from './routes/accounts.js';
+import { banksRouter } from './routes/banks.js';
+import { recurringRouter } from './routes/recurring.js';
+import { autoPostRecurring, startRecurringTimer } from './recurringPost.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 3000;
@@ -48,6 +51,8 @@ app.use('/api/auth', authRouter);
 
 // --- API protegida ---
 app.use('/api', requireAuth);
+// Registra cargos recurrentes vencidos (máx. cada 5 min) antes de responder, para que todo lo leído esté al día.
+app.use('/api', autoPostRecurring);
 app.use('/api', (_req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   next();
@@ -60,6 +65,8 @@ app.use('/api/goals', goalsRouter);
 app.use('/api/budgets', budgetsRouter);
 app.use('/api/dashboard', dashboardRouter);
 app.use('/api/accounts', accountsRouter);
+app.use('/api/banks', banksRouter);
+app.use('/api/recurring', recurringRouter);
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Ruta no encontrada' }));
 app.use(errorHandler);
 
@@ -96,6 +103,7 @@ app.use((req, res) => {
 
 async function main(): Promise<void> {
   await ensureSchema();
+  startRecurringTimer();
   app.listen(PORT, () => {
     console.log(`[server] escuchando en http://localhost:${PORT} (${IS_PROD ? 'producción' : 'desarrollo'})`);
   });

@@ -104,6 +104,7 @@ export interface Transaction {
   account_name: string | null;
   account_bank: string | null;
   installments: number; // 1 = una sola exhibición; >1 = compra a meses con tarjeta
+  recurring_id: number | null; // si lo registró automáticamente un cargo recurrente
   created_at: string;
 }
 export interface TransactionInput {
@@ -433,6 +434,17 @@ export interface DashboardYear {
     guardado: number; // kind ahorro + inversion
     accounts_count: number;
     by_bank: BankTotal[]; // top 5 por total desc
+    est_yield_month: number; // rendimiento mensual estimado de todos los bancos
+    est_yield_year: number;
+    over_cap_total: number; // dinero por encima de topes de rendimiento
+    top_suggestion: YieldSuggestion | null; // la sugerencia que más gana al año
+  };
+  /** Cargos recurrentes activos (suscripciones, pagos fijos). */
+  recurring: {
+    active: number;
+    monthly_expense: number; // equivalente mensual de los cargos (gastos) activos
+    monthly_income: number; // equivalente mensual de los ingresos recurrentes activos
+    upcoming: UpcomingCharge[]; // próximos 30 días (máx. 6), por fecha
   };
   recent: Transaction[]; // últimos 8 movimientos
   available_years: number[]; // años con datos, desc (incluye el actual)
@@ -451,7 +463,75 @@ export interface DashboardYear {
 //  DELETE /api/accounts/:id/adjustments/:adjustmentId -> { ok: true }
 //  POST   /api/accounts/transfers            TransferInput -> Transfer
 //  DELETE /api/accounts/transfers/:id        -> { ok: true }
+//  POST   /api/accounts/:id/yield            YieldInput -> Account (registra rendimiento pagado por el banco;
+//           se guarda en balance_adjustments con source='rendimiento'; se borra con DELETE .../adjustments/:id)
+//
+// Mis bancos (rendimiento anual con tope)
+//  GET    /api/banks                         -> Bank[] (con calculados, orden por nombre)
+//  POST   /api/banks                         BankInput -> Bank   (409 si ya existe el nombre, sin distinguir mayúsculas)
+//  PUT    /api/banks/:id                     Partial<BankInput> -> Bank (renombrar actualiza accounts.bank de sus cuentas)
+//  DELETE /api/banks/:id                     -> { ok: true } (409 si tiene cuentas: primero muévelas o edítalas)
+//
+// RENDIMIENTOS (implementación única en server/yields.ts):
+//  - Saldo que rinde de un banco = suma de balance de sus cuentas NO archivadas con earns_yield = true (mínimo 0).
+//  - Rendimiento anual estimado = min(saldo, tope) * annual_rate/100 + max(0, saldo - tope) * rate_above_cap/100
+//    (sin tope: saldo * annual_rate/100). Mensual = anual/12; diario = anual/365. Interés simple, es una ESTIMACIÓN.
+//  - Por cuenta: parte proporcional a su saldo (si earns_yield y saldo > 0).
+//  - Sugerencias: el dinero por encima del tope de un banco (que rinde rate_above_cap) se sugiere mover a bancos con
+//    mayor tasa y espacio bajo su tope (o sin tope), en orden de tasa desc; solo si gana >= $1 al año.
 // ---------------------------------------------------------------------------
+export interface Bank {
+  id: number;
+  name: string;
+  color: string;
+  annual_rate: number; // % anual, p. ej. 15
+  yield_cap: number | null; // monto máximo que genera annual_rate; null = sin tope
+  rate_above_cap: number; // % anual para lo que exceda el tope (normalmente 0)
+  created_at: string;
+  // calculados (a hoy, cuentas no archivadas)
+  accounts_count: number;
+  balance: number; // suma de saldos de sus cuentas
+  yield_balance: number; // saldo que rinde (cuentas con earns_yield, mínimo 0)
+  over_cap: number; // saldo que rinde por encima del tope (0 si no hay tope)
+  cap_room: number | null; // espacio libre bajo el tope (null si no hay tope)
+  est_yield_day: number;
+  est_yield_month: number;
+  est_yield_year: number;
+  effective_rate: number; // % anual efectivo sobre yield_balance (annual_rate si yield_balance = 0)
+  yield_registered_year: number; // rendimientos registrados en el año actual en sus cuentas
+}
+export interface BankInput {
+  name: string;
+  color?: string;
+  annual_rate: number; // 0..1000
+  yield_cap?: number | null;
+  rate_above_cap?: number;
+}
+export interface YieldInput {
+  amount: number; // > 0
+  date?: string; // por defecto hoy
+  note?: string;
+}
+export interface YieldSuggestion {
+  from_bank_id: number;
+  from_bank: string;
+  to_bank_id: number;
+  to_bank: string;
+  amount: number;
+  extra_year: number; // rendimiento adicional estimado al año
+}
+export interface YieldsSummary {
+  est_day: number;
+  est_month: number;
+  est_year: number;
+  effective_rate: number; // % anual efectivo sobre todo el saldo que rinde
+  yield_balance: number;
+  over_cap_total: number;
+  registered_year: number; // rendimientos registrados en el año del overview
+  monthly_registered: { month: number; amount: number }[]; // 12 meses del año del overview
+  suggestions: YieldSuggestion[];
+}
+
 export type AccountKind = 'disponible' | 'ahorro' | 'inversion' | 'efectivo';
 
 export const ACCOUNT_KIND_LABELS: Record<AccountKind, string> = {
@@ -464,7 +544,9 @@ export const ACCOUNT_KIND_LABELS: Record<AccountKind, string> = {
 export interface Account {
   id: number;
   name: string; // p. ej. "Nómina", "Cuenta de ahorro"
-  bank: string; // p. ej. "BBVA", "Nu"; '' si no aplica
+  bank: string; // nombre del banco (copia de banks.name); '' si no tiene banco
+  bank_id: number | null;
+  earns_yield: boolean; // si su saldo cuenta para el rendimiento de su banco
   kind: AccountKind;
   opening_balance: number; // saldo al inicio de opening_date
   opening_date: string;
@@ -473,6 +555,7 @@ export interface Account {
   created_at: string;
   // calculados (a hoy)
   balance: number;
+  est_yield_month: number; // parte proporcional del rendimiento mensual estimado de su banco
   inflow_this_month: number; // entradas del mes actual (ingresos, transferencias recibidas, ajustes +)
   outflow_this_month: number; // salidas del mes actual (positivo)
   last_movement_date: string | null;
@@ -480,7 +563,8 @@ export interface Account {
 }
 export interface AccountInput {
   name: string;
-  bank?: string;
+  bank_id?: number | null; // el nombre del banco lo pone el servidor
+  earns_yield?: boolean; // por defecto true
   kind: AccountKind;
   opening_balance: number; // puede ser negativo (sobregiro)
   opening_date?: string; // por defecto hoy
@@ -501,7 +585,8 @@ export type AccountMovementSource =
   | 'loan_payment'
   | 'transfer_in'
   | 'transfer_out'
-  | 'adjustment';
+  | 'adjustment'
+  | 'yield';
 
 export interface AccountMovement {
   key: string; // único: 'opening', 'tx-12', 'cp-3', 'lp-5', 'tr-7', 'adj-2'
@@ -562,4 +647,119 @@ export interface AccountsOverview {
   by_bank: BankTotal[]; // solo no archivadas, total desc
   monthly: AccountsMonth[]; // siempre 12
   available_years: number[]; // desc, incluye el actual
+  banks: Bank[]; // todos los bancos (también sin cuentas)
+  yields: YieldsSummary;
+}
+
+// ---------------------------------------------------------------------------
+// Cargos recurrentes (suscripciones, renta, pagos fijos, ingresos fijos)
+//  GET    /api/recurring                     -> RecurringOverview
+//  POST   /api/recurring                     RecurringInput -> RecurringCharge
+//  PUT    /api/recurring/:id                 Partial<RecurringInput> -> RecurringCharge
+//  DELETE /api/recurring/:id                 -> { ok: true } (los movimientos ya registrados se conservan)
+//  POST   /api/recurring/run                 -> { posted: number } (registra ya los cargos vencidos)
+//  GET    /api/recurring/upcoming?days=30    -> UpcomingCharge[] (1..366 días, por fecha)
+//
+// REGLAS (implementación única del calendario en server/recurring.ts):
+//  - frequency 'daily':   start_date + k * interval_n días.
+//  - frequency 'weekly':  primer día >= start_date con weekday (0 = domingo); luego cada 7 * interval_n días.
+//  - frequency 'monthly': día day_of_month (ajustado al último día si el mes no lo tiene) del primer mes cuya fecha
+//                         sea >= start_date; luego cada interval_n meses.
+//  - frequency 'yearly':  month_of_year/day_of_month (ajustado) del primer año con fecha >= start_date; cada interval_n años.
+//  - Nunca después de end_date (si hay).
+//  - Registro automático (auto_post = true y active = true): cada ocurrencia con fecha <= hoy y > last_posted_date se
+//    guarda como transacción (type, amount, category_id, description = name, account_id o credit_card_id,
+//    installments = 1, recurring_id). Índice único (recurring_id, date): nunca se duplica. Se ejecuta al arrancar el
+//    servidor, cada hora mientras está despierto y como máximo cada 5 minutos al recibir peticiones con sesión, así
+//    se ponen al día los días en que Render estuvo dormido.
+//  - Al crear: si backfill = false (por defecto) y start_date es pasado, last_posted_date = última ocurrencia ANTES de
+//    hoy (no se registran cargos pasados; el de hoy sí). Con backfill = true se registran desde start_date (máx. 400).
+//  - Borrar un movimiento generado no lo vuelve a crear (last_posted_date ya avanzó).
+//  - Forma de pago igual que en movimientos: credit_card_id solo para gastos y entonces account_id = null.
+//  - Equivalente mensual: daily = amount * 30.4375 / n; weekly = amount * 52 / 12 / n; monthly = amount / n;
+//    yearly = amount / (12 * n).
+// ---------------------------------------------------------------------------
+export type RecurringFrequency = 'daily' | 'weekly' | 'monthly' | 'yearly';
+
+export const RECURRING_FREQUENCY_LABELS: Record<RecurringFrequency, string> = {
+  daily: 'Cada día',
+  weekly: 'Cada semana',
+  monthly: 'Cada mes',
+  yearly: 'Cada año',
+};
+
+export const WEEKDAY_LABELS = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+
+export interface RecurringCharge {
+  id: number;
+  name: string; // p. ej. "Netflix"; se usa como descripción del movimiento
+  type: TxType;
+  amount: number;
+  category_id: number | null;
+  category_name: string | null;
+  category_icon: string | null;
+  account_id: number | null;
+  account_name: string | null;
+  credit_card_id: number | null;
+  card_name: string | null;
+  frequency: RecurringFrequency;
+  interval_n: number; // cada N días/semanas/meses/años (1 = cada uno)
+  day_of_month: number | null; // monthly / yearly
+  weekday: number | null; // weekly (0 = domingo)
+  month_of_year: number | null; // yearly (1..12)
+  start_date: string;
+  end_date: string | null;
+  active: boolean;
+  auto_post: boolean;
+  last_posted_date: string | null;
+  color: string;
+  created_at: string;
+  // calculados
+  schedule_label: string; // p. ej. "Cada mes el día 5", "Cada 2 semanas los lunes"
+  next_date: string | null; // próxima ocurrencia > last_posted_date (o >= hoy si no hay), null si terminó
+  next_dates: string[]; // próximas 3
+  monthly_equivalent: number;
+  posted_count: number; // movimientos generados por este cargo
+  posted_total: number; // suma de esos movimientos
+}
+
+export interface RecurringInput {
+  name: string;
+  type?: TxType; // por defecto 'expense'
+  amount: number;
+  category_id?: number | null;
+  account_id?: number | null;
+  credit_card_id?: number | null;
+  frequency: RecurringFrequency;
+  interval_n?: number; // 1..365, por defecto 1
+  day_of_month?: number | null; // requerido para monthly y yearly
+  weekday?: number | null; // requerido para weekly
+  month_of_year?: number | null; // requerido para yearly
+  start_date?: string; // por defecto hoy
+  end_date?: string | null;
+  active?: boolean;
+  auto_post?: boolean;
+  color?: string;
+  backfill?: boolean; // solo al crear
+}
+
+export interface UpcomingCharge {
+  recurring_id: number;
+  name: string;
+  type: TxType;
+  amount: number;
+  date: string;
+  payment_label: string; // "Tarjeta X", "Banco · Cuenta" o "Sin especificar"
+  category_icon: string | null;
+}
+
+export interface RecurringOverview {
+  items: RecurringCharge[]; // activos primero, luego por próxima fecha
+  totals: {
+    active: number;
+    monthly_expense: number;
+    monthly_income: number;
+    next_30_days_expense: number;
+  };
+  upcoming: UpcomingCharge[]; // próximos 30 días
 }

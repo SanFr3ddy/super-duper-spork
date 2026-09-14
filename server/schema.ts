@@ -106,6 +106,32 @@ CREATE TABLE IF NOT EXISTS accounts (
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Mis bancos: rendimiento anual con tope (p. ej. 15% anual hasta $10,000; por encima, rate_above_cap)
+CREATE TABLE IF NOT EXISTS banks (
+  id              SERIAL PRIMARY KEY,
+  name            TEXT NOT NULL,
+  color           TEXT NOT NULL DEFAULT '#e5202e',
+  annual_rate     NUMERIC(7,3) NOT NULL DEFAULT 0 CHECK (annual_rate >= 0 AND annual_rate <= 1000),
+  yield_cap       NUMERIC(14,2) CHECK (yield_cap IS NULL OR yield_cap >= 0),
+  rate_above_cap  NUMERIC(7,3) NOT NULL DEFAULT 0 CHECK (rate_above_cap >= 0 AND rate_above_cap <= 1000),
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_banks_name_ci ON banks (lower(name));
+
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS bank_id INT REFERENCES banks(id) ON DELETE SET NULL;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS earns_yield BOOLEAN NOT NULL DEFAULT true;
+CREATE INDEX IF NOT EXISTS idx_accounts_bank ON accounts(bank_id);
+
+-- Migración: los nombres de banco escritos a mano pasan a ser bancos (idempotente)
+INSERT INTO banks (name)
+  SELECT DISTINCT ON (lower(trim(bank))) trim(bank) FROM accounts
+   WHERE bank_id IS NULL AND trim(bank) <> ''
+   ORDER BY lower(trim(bank)), id
+ON CONFLICT (lower(name)) DO NOTHING;
+UPDATE accounts a SET bank_id = b.id, bank = b.name
+  FROM banks b
+ WHERE a.bank_id IS NULL AND trim(a.bank) <> '' AND lower(trim(a.bank)) = lower(b.name);
+
 ALTER TABLE transactions  ADD COLUMN IF NOT EXISTS account_id INT REFERENCES accounts(id) ON DELETE SET NULL;
 ALTER TABLE card_payments ADD COLUMN IF NOT EXISTS account_id INT REFERENCES accounts(id) ON DELETE SET NULL;
 ALTER TABLE loan_payments ADD COLUMN IF NOT EXISTS account_id INT REFERENCES accounts(id) ON DELETE SET NULL;
@@ -138,6 +164,38 @@ CREATE TABLE IF NOT EXISTS balance_adjustments (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_balance_adjustments_account ON balance_adjustments(account_id);
+-- 'ajuste' = cuadrar con el banco; 'rendimiento' = intereses que pagó el banco
+ALTER TABLE balance_adjustments ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'ajuste';
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'balance_adjustments_source_chk') THEN
+    ALTER TABLE balance_adjustments ADD CONSTRAINT balance_adjustments_source_chk CHECK (source IN ('ajuste', 'rendimiento'));
+  END IF;
+END $$;
+
+-- Cargos recurrentes (suscripciones, pagos e ingresos fijos) que se registran solos
+CREATE TABLE IF NOT EXISTS recurring_charges (
+  id                SERIAL PRIMARY KEY,
+  name              TEXT NOT NULL,
+  type              TEXT NOT NULL DEFAULT 'expense' CHECK (type IN ('income', 'expense')),
+  amount            NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+  category_id       INT REFERENCES categories(id) ON DELETE SET NULL,
+  account_id        INT REFERENCES accounts(id) ON DELETE SET NULL,
+  credit_card_id    INT REFERENCES credit_cards(id) ON DELETE SET NULL,
+  frequency         TEXT NOT NULL CHECK (frequency IN ('daily', 'weekly', 'monthly', 'yearly')),
+  interval_n        INT NOT NULL DEFAULT 1 CHECK (interval_n BETWEEN 1 AND 365),
+  day_of_month      INT CHECK (day_of_month BETWEEN 1 AND 31),
+  weekday           INT CHECK (weekday BETWEEN 0 AND 6),
+  month_of_year     INT CHECK (month_of_year BETWEEN 1 AND 12),
+  start_date        DATE NOT NULL DEFAULT CURRENT_DATE,
+  end_date          DATE,
+  active            BOOLEAN NOT NULL DEFAULT true,
+  auto_post         BOOLEAN NOT NULL DEFAULT true,
+  last_posted_date  DATE,
+  color             TEXT NOT NULL DEFAULT '#e5202e',
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS recurring_id INT REFERENCES recurring_charges(id) ON DELETE SET NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_recurring_date ON transactions(recurring_id, date) WHERE recurring_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS sessions (
   sid         TEXT PRIMARY KEY,
