@@ -139,6 +139,9 @@ CREATE INDEX IF NOT EXISTS idx_transactions_account ON transactions(account_id);
 
 -- Compras a meses (solo gastos con tarjeta): 1 = una sola exhibición
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS installments INT NOT NULL DEFAULT 1 CHECK (installments BETWEEN 1 AND 48);
+-- Desglose en tramos [{months, amount}] y mes de la primera mensualidad ('YYYY-MM'); null = pagos iguales / mes siguiente
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS installment_plan JSONB;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS installment_first_month TEXT CHECK (installment_first_month IS NULL OR installment_first_month ~ '^[0-9]{4}-(0[1-9]|1[0-2])$');
 CREATE INDEX IF NOT EXISTS idx_card_payments_account ON card_payments(account_id);
 CREATE INDEX IF NOT EXISTS idx_loan_payments_account ON loan_payments(account_id);
 

@@ -29,8 +29,11 @@
  * COMPRAS A MESES (diferidas / meses sin intereses), solo gastos con tarjeta de crédito:
  *  - transactions.installments = número de mensualidades (1 = una sola exhibición).
  *  - La compra sigue contando como GASTO COMPLETO en su fecha (flujo, presupuestos y resumen no cambian).
- *  - Mensualidad = round2(total / n); la última ajusta centavos (total - mensualidad * (n - 1)).
- *  - La mensualidad k (1..n) corresponde al mes (mes de compra + k): la primera se paga el mes siguiente a la compra.
+ *  - Sin desglose: mensualidad = round2(total / n); la última ajusta centavos (total - mensualidad * (n - 1)).
+ *  - Con desglose (transactions.installment_plan = [{ months, amount }, ...] en orden): la mensualidad k usa el monto
+ *    del tramo que la contiene; n = suma de months; la suma de months * amount debe ser igual al total (±0.05).
+ *  - Primera mensualidad: transactions.installment_first_month ('YYYY-MM') si existe; si no, mes de compra + 1.
+ *    La mensualidad k (1..n) cae en primera + (k - 1).
  *  - Deuda diferida pendiente de una tarjeta = suma de mensualidades de meses POSTERIORES al mes de referencia.
  *  - Pago para no generar intereses este mes = max(0, deuda de la tarjeta - deuda diferida pendiente).
  *  Implementación única en server/installments.ts.
@@ -104,6 +107,8 @@ export interface Transaction {
   account_name: string | null;
   account_bank: string | null;
   installments: number; // 1 = una sola exhibición; >1 = compra a meses con tarjeta
+  installment_plan?: InstallmentSegment[] | null; // desglose en tramos (null = pagos iguales)
+  installment_first_month?: string | null; // 'YYYY-MM' (null = mes siguiente a la compra)
   recurring_id: number | null; // si lo registró automáticamente un cargo recurrente
   created_at: string;
 }
@@ -116,6 +121,15 @@ export interface TransactionInput {
   credit_card_id?: number | null; // solo para gastos pagados con tarjeta de crédito
   account_id?: number | null; // cuenta; el servidor la fuerza a null si hay credit_card_id
   installments?: number; // 1..48; el servidor lo fuerza a 1 si no es gasto con tarjeta
+  /** Desglose opcional en tramos (solo compras a meses con tarjeta). null = pagos iguales. */
+  installment_plan?: InstallmentSegment[] | null;
+  /** 'YYYY-MM' de la primera mensualidad; null = mes siguiente a la compra. */
+  installment_first_month?: string | null;
+}
+
+export interface InstallmentSegment {
+  months: number; // >= 1
+  amount: number; // monto de cada mensualidad del tramo (> 0)
 }
 export interface TransactionsResponse {
   items: Transaction[];
@@ -179,6 +193,8 @@ export interface InstallmentPlan {
   billed_amount: number; // suma de mensualidades hasta el mes de referencia (incluido)
   remaining_amount: number; // total - billed_amount
   remaining_installments: number; // mensualidades después del mes de referencia
+  segments?: InstallmentSegment[]; // desglose efectivo (pagos iguales se expresan como 1-2 tramos)
+  custom_plan?: boolean; // true si la compra tiene desglose propio
 }
 
 export interface InstallmentsResponse {

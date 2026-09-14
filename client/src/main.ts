@@ -15,6 +15,7 @@ import * as goals from './views/goals';
 import * as budgets from './views/budgets';
 import * as categories from './views/categories';
 import * as accounts from './views/accounts';
+import * as recurring from './views/recurring';
 
 interface View {
   render: (root: HTMLElement) => Promise<void> | void;
@@ -35,6 +36,7 @@ export const ROUTES: Route[] = [
   { path: 'resumen', title: 'Resumen', subtitle: 'Tu año de un vistazo', icon: '📊', view: dashboard, nav: true },
   { path: 'dinero', title: 'Mi dinero', subtitle: 'Cuánto tienes y en qué banco está', icon: '💰', view: accounts, nav: true, short: 'Dinero' },
   { path: 'movimientos', title: 'Movimientos', subtitle: 'Ingresos y gastos', icon: '🧾', view: transactions, nav: true, short: 'Movim.' },
+  { path: 'suscripciones', title: 'Suscripciones', subtitle: 'Cargos que se repiten y se registran solos', icon: '🔁', view: recurring, nav: true, short: 'Suscrip.' },
   { path: 'tarjetas', title: 'Tarjetas', subtitle: 'Tarjetas de crédito, pagos y compras a meses', icon: '💳', view: cards, nav: true },
   { path: 'prestamos', title: 'Préstamos', subtitle: 'Deudas y su avance', icon: '🏦', view: loans, nav: true },
   { path: 'ahorros', title: 'Metas', subtitle: 'Metas de ahorro y aportes', icon: '🎯', view: goals, nav: true },
@@ -165,11 +167,14 @@ function walletPopoverHtml(active: Account[], total: number): string {
   const disponible = active.filter((a) => isDisponibleKind(a.kind)).reduce((acc, a) => acc + a.balance, 0);
   const guardado = total - disponible;
   const sorted = [...active].sort((a, b) => b.balance - a.balance);
+  // Rendimiento mensual estimado de los bancos (parte proporcional de cada cuenta activa).
+  const yieldMonth = active.reduce((acc, a) => acc + (Number(a.est_yield_month) || 0), 0);
   return `
     <div class="wallet-popover">
       <div class="wallet-split">
         <div><span class="muted small">Disponible</span><div class="amt">${esc(money(disponible))}</div></div>
         <div><span class="muted small">Guardado</span><div class="amt">${esc(money(guardado))}</div></div>
+        ${yieldMonth >= 0.005 ? `<div class="small muted" style="grid-column:1 / -1">Rinde <span class="white bold">~${esc(money(yieldMonth))}</span> al mes</div>` : ''}
       </div>
       <div class="wallet-list">
         ${sorted

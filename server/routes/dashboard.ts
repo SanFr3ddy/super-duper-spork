@@ -2,8 +2,9 @@ import { Router } from 'express';
 import { query } from '../db.js';
 import { HttpError, monthRange, round2, todayISO } from '../util.js';
 import { loanStatus, type LoanPaymentLite } from '../loanMath.js';
-import { accountTotals, bankTotals, loadAccounts } from '../accountsData.js';
+import { accountTotals, bankTotals, loadAccounts, loadBanks, yieldsSummary } from '../accountsData.js';
 import { currentYM, loadPlanSources, totalsByCard } from '../installments.js';
+import { recurringOverview } from '../recurringData.js';
 import type { CategoryTotal, DashboardYear, MonthSummary, Transaction, TxType } from '../../shared/types.js';
 
 /**
@@ -16,6 +17,8 @@ import type { CategoryTotal, DashboardYear, MonthSummary, Transaction, TxType } 
  *  - net = income - expenses - loan_payments - savings  (flujo neto)
  *  - money: saldos de cuentas a hoy (server/accountsData.ts)
  *  - cards.*installments*: compras a meses del mes actual (server/installments.ts)
+ *  - money.est_yield_* / over_cap_total / top_suggestion: rendimientos a hoy (loadBanks + yieldsSummary del año actual)
+ *  - recurring: cargos recurrentes activos y próximos 30 días (server/recurringData.ts)
  */
 export const dashboardRouter = Router();
 
@@ -133,7 +136,7 @@ dashboardRouter.get('/', async (req, res) => {
   const cmMonth = year === curYear ? curMonth : 12;
   const cm = monthRange(cmYear, cmMonth);
 
-  const [txRows, cardPayRows, loanPayRows, goalContribRows, expensesByCategory, incomeByCategory, cmExpensesByCategory, budgetRow, cardRows, loanRows, loanPaymentRows, goalRows, recentRows, yearRows, accounts, planSources] =
+  const [txRows, cardPayRows, loanPayRows, goalContribRows, expensesByCategory, incomeByCategory, cmExpensesByCategory, budgetRow, cardRows, loanRows, loanPaymentRows, goalRows, recentRows, yearRows, accounts, planSources, recurringOv] =
     await Promise.all([
       query<TxMonthRow>(
         `SELECT EXTRACT(MONTH FROM date)::int AS m,
@@ -193,7 +196,7 @@ dashboardRouter.get('/', async (req, res) => {
         `SELECT t.id, t.type, t.amount, t.category_id,
                 c.name AS category_name, c.color AS category_color, c.icon AS category_icon,
                 t.description, t.date, t.credit_card_id, cc.name AS card_name,
-                t.account_id, a.name AS account_name, a.bank AS account_bank, t.installments, t.created_at
+                t.account_id, a.name AS account_name, a.bank AS account_bank, t.installments, t.recurring_id, t.created_at
            FROM transactions t
            LEFT JOIN categories c ON c.id = t.category_id
            LEFT JOIN credit_cards cc ON cc.id = t.credit_card_id
@@ -211,7 +214,12 @@ dashboardRouter.get('/', async (req, res) => {
       ),
       loadAccounts(),
       loadPlanSources(),
+      recurringOverview(today),
     ]);
+
+  // Rendimientos a hoy: reutiliza la lista completa de cuentas (server/accountsData.ts + server/yields.ts).
+  const banks = await loadBanks(accounts);
+  const yields = await yieldsSummary(banks, curYear);
 
   // --- Meses (siempre 12) ---
   const months: MonthSummary[] = Array.from({ length: 12 }, (_, i) => ({
@@ -350,6 +358,7 @@ dashboardRouter.get('/', async (req, res) => {
     account_name: r.account_name ?? null,
     account_bank: r.account_name != null ? (r.account_bank ?? '') : null,
     installments: Math.max(1, num(r.installments) || 1),
+    recurring_id: r.recurring_id ?? null,
     created_at: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
   }));
 
@@ -417,6 +426,16 @@ dashboardRouter.get('/', async (req, res) => {
       guardado: accTotals.guardado,
       accounts_count: accTotals.accounts,
       by_bank: bankTotals(accounts).slice(0, 5),
+      est_yield_month: yields.est_month,
+      est_yield_year: yields.est_year,
+      over_cap_total: yields.over_cap_total,
+      top_suggestion: yields.suggestions[0] ?? null,
+    },
+    recurring: {
+      active: recurringOv.totals.active,
+      monthly_expense: recurringOv.totals.monthly_expense,
+      monthly_income: recurringOv.totals.monthly_income,
+      upcoming: recurringOv.upcoming.slice(0, 6),
     },
     recent,
     available_years: availableYears,

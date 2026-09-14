@@ -29,7 +29,7 @@ const TX_FROM = `FROM transactions t
 const TX_SELECT = `SELECT t.id, t.type, t.amount, t.category_id,
     c.name AS category_name, c.color AS category_color, c.icon AS category_icon,
     t.description, t.date, t.credit_card_id, cc.name AS card_name,
-    t.account_id, a.name AS account_name, a.bank AS account_bank, t.installments, t.created_at
+    t.account_id, a.name AS account_name, a.bank AS account_bank, t.installments, t.recurring_id, t.created_at
   ${TX_FROM}`;
 
 interface TxValues {

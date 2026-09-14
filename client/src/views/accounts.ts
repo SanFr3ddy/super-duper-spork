@@ -1,7 +1,10 @@
 /**
- * Vista "Mi dinero": dinero real por cuenta y por banco, con transferencias y ajustes de saldo.
- * Contrato: sección "Mi dinero" de shared/types.ts. API: /api/accounts (server/routes/accounts.ts).
- * Los saldos los calcula SIEMPRE el servidor (server/accountsData.ts); aquí solo se muestran.
+ * Vista "Mi dinero": dinero real por cuenta y por banco, con transferencias, ajustes de saldo,
+ * Mis bancos (rendimiento anual con tope) y registro de rendimientos.
+ * Contrato: secciones "Mi dinero" y "Mis bancos" de shared/types.ts.
+ * API: /api/accounts (server/routes/accounts.ts) y /api/banks (server/routes/banks.ts).
+ * Los saldos y rendimientos los calcula SIEMPRE el servidor (server/accountsData.ts, server/yields.ts);
+ * aquí solo se muestran. La única cuenta local es la vista previa del formulario de banco.
  */
 import { ACCOUNT_KIND_LABELS } from '../../../shared/types';
 import type {
@@ -12,13 +15,17 @@ import type {
   AccountMovement,
   AccountMovementSource,
   AccountsOverview,
+  Bank,
+  BankInput,
   BankTotal,
   Transfer,
   TransferInput,
+  YieldInput,
+  YieldSuggestion,
 } from '../../../shared/types';
-import { api, qs } from '../api';
-import { esc, money, moneySigned, pct, fmtDate, monthName, todayISO, currentYear } from '../format';
-import { formModal, openModal, confirmDialog, toast, showError, field, input, moneyInput, select, emptyState, loadingState, on, toNumber } from '../ui';
+import { api, qs, ApiError } from '../api';
+import { esc, money, moneySigned, pct, fmtDate, monthName, todayISO, currentYear, settings } from '../format';
+import { formModal, openModal, confirmDialog, toast, showError, field, input, moneyInput, select, emptyState, loadingState, on, toNumber, progressBar } from '../ui';
 import { monthlyBars, horizontalBars, legendHtml, COLORS, destroyChart } from '../charts';
 
 const MIN_YEAR = 2000;
@@ -26,7 +33,8 @@ const MAX_YEAR = 2100;
 const DEFAULT_COLOR = '#e5202e';
 const HEX_RE = /^#[0-9a-f]{6}$/i;
 const KINDS = Object.keys(ACCOUNT_KIND_LABELS) as AccountKind[];
-const COMMON_BANKS = [
+/** Solo nombres para autocompletar: las tasas NO se sugieren (cambian seguido; las escribe el usuario). */
+const BANK_SUGGESTIONS = [
   'BBVA',
   'Banorte',
   'Santander',
@@ -34,16 +42,28 @@ const COMMON_BANKS = [
   'HSBC',
   'Scotiabank',
   'Nu',
+  'DiDi',
+  'Revolut',
   'Mercado Pago',
   'Hey Banco',
-  'Banco Azteca',
-  'Inbursa',
+  'Ualá',
   'Klar',
   'Stori',
-  'Spin by OXXO',
+  'Openbank',
+  'Finsus',
+  'Kubo Financiero',
   'Cetes Directo',
   'GBM',
+  'Banco Azteca',
+  'Inbursa',
+  'Spin by OXXO',
 ];
+/** Saldo de ejemplo para la vista previa de un banco sin cuentas. */
+const EXAMPLE_BALANCE = 10_000;
+/** Valores especiales del select de banco del formulario de cuenta. */
+const NEW_BANK = '__new';
+const KEEP_BANK = '__keep';
+const MAX_SUGGESTIONS = 3;
 
 const SOURCE_LABELS: Record<AccountMovementSource, string> = {
   opening: 'Saldo inicial',
@@ -54,6 +74,7 @@ const SOURCE_LABELS: Record<AccountMovementSource, string> = {
   transfer_in: 'Transferencia',
   transfer_out: 'Transferencia',
   adjustment: 'Ajuste',
+  yield: 'Rendimiento',
 };
 const SOURCE_LINKS: Partial<Record<AccountMovementSource, string>> = {
   income: '#/movimientos',
@@ -77,6 +98,8 @@ let loadToken = 0;
 let fullPending = false;
 let bankCanvas: HTMLCanvasElement | null = null;
 let monthCanvas: HTMLCanvasElement | null = null;
+let yieldBankCanvas: HTMLCanvasElement | null = null;
+let yieldMonthCanvas: HTMLCanvasElement | null = null;
 
 const STYLE = `<style>
 .v-money .grid > .card { margin-top: 0; }
@@ -113,6 +136,31 @@ const STYLE = `<style>
 .v-money-mv .v-money-mv-concept { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .v-money-mv .v-money-mv-desc { color: var(--text-2); font-size: .85rem; margin-top: 3px; overflow-wrap: anywhere; }
 .v-money-mv tr.future td { color: var(--muted); }
+.v-money .v-money-bank-rate { color: var(--text-2); font-weight: 600; }
+.v-money .v-money-acc-yield { font-size: .85rem; color: var(--text-2); }
+.v-money .v-money-mybanks .card-head .sub { flex: 1 1 auto; }
+.v-money .v-money-bk-list { display: flex; flex-direction: column; }
+.v-money .v-money-bk { display: flex; flex-direction: column; gap: 8px; padding: 12px 0; border-bottom: 1px solid var(--border); min-width: 0; }
+.v-money .v-money-bk:first-child { padding-top: 0; }
+.v-money .v-money-bk:last-child { border-bottom: 0; padding-bottom: 0; }
+.v-money .v-money-bk-top { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.v-money .v-money-bk-top .grow { flex: 1; min-width: 0; }
+.v-money .v-money-bk-top .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.v-money .v-money-bk-terms { color: var(--text-2); font-size: .85rem; overflow-wrap: anywhere; }
+.v-money .v-money-bk-bal { flex: none; text-align: right; }
+.v-money .v-money-bk-bal .total { font-weight: 700; white-space: nowrap; }
+.v-money .v-money-cap-foot { display: flex; justify-content: space-between; align-items: baseline; gap: 2px 10px; flex-wrap: wrap; margin-top: 6px; font-size: .85rem; }
+.v-money .v-money-cap-foot > span:first-child { overflow-wrap: anywhere; }
+.v-money .v-money-bk-foot { display: flex; align-items: center; justify-content: space-between; gap: 6px 10px; flex-wrap: wrap; font-size: .85rem; color: var(--text-2); }
+.v-money .v-money-bk-foot .row { gap: 6px; }
+.v-money .v-money-suggests { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
+.v-money .v-money-suggest { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; flex-wrap: wrap; }
+.v-money .v-money-suggest > span { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
+.v-money .v-money-yield-charts { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
+.v-money .v-money-yield-box { min-width: 0; }
+.v-money .v-money-yield-box .card-head { margin-bottom: 10px; }
+.v-money-preview { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 14px; font-size: .9rem; color: var(--text-2); min-height: 1.4em; overflow-wrap: anywhere; }
+.v-money-field-check { display: flex; flex-direction: column; gap: 4px; }
 </style>`;
 
 // ---------------------------------------------------------------------------
@@ -127,9 +175,11 @@ export async function render(root: HTMLElement): Promise<void> {
   if (actions) {
     actions.innerHTML = `
       <button type="button" class="btn primary" id="money-new">+ Nueva cuenta</button>
-      <span id="money-transfer-wrap" title="${esc(TRANSFER_DISABLED_MSG)}"><button type="button" class="btn" id="money-transfer" disabled>Transferir</button></span>`;
+      <span id="money-transfer-wrap" title="${esc(TRANSFER_DISABLED_MSG)}"><button type="button" class="btn" id="money-transfer" disabled>Transferir</button></span>
+      <button type="button" class="btn" id="money-banks">Mis bancos</button>`;
     actions.querySelector('#money-new')?.addEventListener('click', () => openAccountForm());
     actions.querySelector('#money-transfer')?.addEventListener('click', () => openTransferForm());
+    actions.querySelector('#money-banks')?.addEventListener('click', () => scrollToBanks());
   }
 
   root.innerHTML = loadingState('Cargando tu dinero…');
@@ -147,8 +197,22 @@ export function destroy(): void {
 function killCharts(): void {
   destroyChart(bankCanvas);
   destroyChart(monthCanvas);
+  destroyChart(yieldBankCanvas);
+  destroyChart(yieldMonthCanvas);
   bankCanvas = null;
   monthCanvas = null;
+  yieldBankCanvas = null;
+  yieldMonthCanvas = null;
+}
+
+/** Botón "Mis bancos" de la barra superior: lleva a la sección (o abre el alta si aún no carga la vista). */
+function scrollToBanks(): void {
+  const el = viewRoot?.querySelector<HTMLElement>('[data-mybanks]');
+  if (!el) {
+    if (data) openBankForm();
+    return;
+  }
+  el.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 // ---------------------------------------------------------------------------
@@ -165,8 +229,10 @@ async function load(kind: 'all' | 'year', initial = false): Promise<void> {
     data = d;
     const partial = kind === 'year' && !fullPending && !!root.querySelector('[data-monthly]');
     fullPending = false;
-    if (partial) paintMonthly();
-    else paint();
+    if (partial) {
+      paintMonthly();
+      paintRegistered();
+    } else paint();
   } catch (err) {
     if (my !== loadToken || viewRoot !== root) return;
     showError(err);
@@ -184,6 +250,7 @@ async function load(kind: 'all' | 'year', initial = false): Promise<void> {
       // Regresa el selector al año que sí está cargado.
       year = data.year;
       paintMonthly();
+      paintRegistered();
     }
   }
 }
@@ -212,6 +279,83 @@ function findAccount(id: string | undefined): Account | undefined {
 
 function plural(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`;
+}
+
+const fmtCache = new Map<string, Intl.NumberFormat>();
+function numberFormat(opts: Intl.NumberFormatOptions): Intl.NumberFormat | null {
+  const key = `${settings.locale}|${settings.currency}|${JSON.stringify(opts)}`;
+  let f = fmtCache.get(key);
+  if (!f) {
+    try {
+      f = new Intl.NumberFormat(settings.locale, opts);
+    } catch {
+      return null; // locale o moneda inválidos: quien llama usa el formato general
+    }
+    fmtCache.set(key, f);
+  }
+  return f;
+}
+
+/** Monto sin centavos cuando es entero ("$10,000"); con centavos si los tiene. */
+function moneyRound(n: number | null | undefined): string {
+  const v = round2(Number(n) || 0);
+  if (!Number.isInteger(v)) return money(v);
+  const f = numberFormat({ style: 'currency', currency: settings.currency, minimumFractionDigits: 0, maximumFractionDigits: 0 });
+  return f ? f.format(v) : money(v);
+}
+
+/** Tasa anual en porcentaje: 15 -> "15%", 10.25 -> "10.25%". */
+function rateText(r: number | null | undefined): string {
+  const v = Number(r) || 0;
+  const f = numberFormat({ maximumFractionDigits: 3 });
+  return `${f ? f.format(v) : String(v)}%`;
+}
+
+function bankById(id: number | null | undefined): Bank | undefined {
+  if (id === null || id === undefined) return undefined;
+  return data?.banks.find((b) => b.id === id);
+}
+
+function bankByName(name: string): Bank | undefined {
+  const k = bankKey(name.trim());
+  if (!k) return undefined;
+  return data?.banks.find((b) => bankKey(b.name) === k);
+}
+
+type BankTermsLike = Pick<Bank, 'annual_rate' | 'yield_cap' | 'rate_above_cap'>;
+
+function bankEarns(b: BankTermsLike): boolean {
+  return b.annual_rate > 0 || (b.yield_cap !== null && b.rate_above_cap > 0);
+}
+
+/** "15% anual hasta $10,000 (después 0%)", "9% anual sin tope" o "Sin rendimiento". */
+function bankTermsText(b: BankTermsLike): string {
+  if (!bankEarns(b)) return 'Sin rendimiento';
+  if (b.yield_cap === null) return `${rateText(b.annual_rate)} anual sin tope`;
+  return `${rateText(b.annual_rate)} anual hasta ${moneyRound(b.yield_cap)} (después ${rateText(b.rate_above_cap)})`;
+}
+
+/**
+ * Solo para la vista previa del formulario de banco (el cálculo real vive en server/yields.ts):
+ * (min(saldo, tope) * tasa + excedente * tasa_excedente) / 100 / 12.
+ */
+function previewMonthly(balance: number, rate: number, cap: number | null, above: number): number {
+  const b = Math.max(0, balance);
+  if (cap === null) return round2((b * rate) / 100 / 12);
+  const within = Math.min(b, cap);
+  const over = Math.max(0, b - cap);
+  return round2((within * rate + over * above) / 100 / 12);
+}
+
+/** Cuentas sugeridas para mover dinero de un banco a otro: origen = la de mayor saldo que rinde; destino = una activa del banco destino. */
+function suggestionPlan(s: YieldSuggestion): { from?: Account; to?: Account } {
+  const active = activeAccounts();
+  const byBalance = (a: Account, b: Account): number => b.balance - a.balance || a.id - b.id;
+  const from = active.filter((a) => a.bank_id === s.from_bank_id && a.earns_yield && a.balance > 0).sort(byBalance)[0];
+  const to = active
+    .filter((a) => a.bank_id === s.to_bank_id)
+    .sort((a, b) => Number(b.earns_yield) - Number(a.earns_yield) || byBalance(a, b))[0];
+  return { from, to };
 }
 
 function syncTopbar(activeCount: number): void {
@@ -250,12 +394,14 @@ function paint(): void {
           'Registra dónde tienes tu dinero: nómina, ahorro, inversión o efectivo. Así sabrás cuánto tienes disponible y en qué banco está.',
           '<button type="button" class="btn primary" data-new>+ Agregar mi primera cuenta</button>',
         )}</div>
-        <div class="tip">Tus metas de ahorro son objetivos; aquí ves tu dinero real y en qué banco está.</div>`
+        <div class="tip">Tus metas de ahorro son objetivos; aquí ves tu dinero real y en qué banco está.</div>
+        ${myBanksHtml(d)}`
       : `${statsHtml(d)}
         <div class="grid grid-2">
           ${banksCardHtml(d)}
           <div class="card" data-monthly></div>
         </div>
+        ${myBanksHtml(d)}
         ${accountsHtml(d, active)}`;
 
   root.innerHTML = `<div class="v-money stack">${STYLE}${body}${archivedHtml(archived, active.length)}</div>`;
@@ -272,7 +418,19 @@ function paint(): void {
     );
     bankCanvas = banks;
   }
+  const yieldBanks = wrap.querySelector<HTMLCanvasElement>('[data-chart="yield-banks"]');
+  if (yieldBanks) {
+    const items = yieldBankItems(d);
+    const total = items.reduce((acc, b) => acc + b.est_yield_month, 0);
+    horizontalBars(
+      yieldBanks,
+      items.map((b) => ({ label: b.name, value: b.est_yield_month, share: total > 0 ? b.est_yield_month / total : 0 })),
+      COLORS.moneyAvailable,
+    );
+    yieldBankCanvas = yieldBanks;
+  }
   paintMonthly();
+  paintRegistered();
 }
 
 function statTile(label: string, value: string, cls: string, foot: string): string {
@@ -285,13 +443,157 @@ function statTile(label: string, value: string, cls: string, foot: string): stri
 
 function statsHtml(d: AccountsOverview): string {
   const t = d.totals;
-  const top = d.by_bank[0] && d.by_bank[0].total > 0 ? d.by_bank[0] : null;
+  const y = d.yields;
+  const yieldFoot = y.est_year > 0 ? `${money(y.est_year)} al año · ${rateText(y.effective_rate)} promedio` : 'Configura la tasa de tus bancos';
   return `<div class="grid grid-4">
     ${statTile('Dinero total', money(t.total), t.total < 0 ? 'red' : 'white', `${plural(t.accounts, 'cuenta', 'cuentas')} en ${plural(d.by_bank.length, 'banco', 'bancos')}`)}
     ${statTile('Disponible', money(t.disponible), t.disponible < 0 ? 'red' : 'white', 'Débito, nómina y efectivo')}
     ${statTile('Guardado', money(t.guardado), t.guardado < 0 ? 'red' : '', `Ahorro ${money(t.ahorro)} · Inversión ${money(t.inversion)}`)}
-    ${statTile('Mayor banco', top ? top.bank : '—', '', top ? `${pct(top.share)} de tu dinero` : 'Aún sin saldo a favor')}
+    ${statTile('Rinde al mes', money(y.est_month), 'white', yieldFoot)}
   </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Mis bancos
+// ---------------------------------------------------------------------------
+function yieldBankItems(d: AccountsOverview): Bank[] {
+  return d.banks.filter((b) => b.est_yield_month > 0).sort((a, b) => b.est_yield_month - a.est_yield_month || a.name.localeCompare(b.name, 'es'));
+}
+
+function myBanksHtml(d: AccountsOverview): string {
+  const head = `<div class="card-head">
+      <h2>Mis bancos</h2>
+      <span class="sub">Rendimiento estimado a hoy</span>
+      <button type="button" class="btn sm" data-bank-new>+ Nuevo banco</button>
+    </div>`;
+  if (d.banks.length === 0) {
+    return `<div class="card v-money-mybanks" data-mybanks>
+      ${head}
+      <div class="v-money-empty-sm">${emptyState(
+        '🏦',
+        'Agrega tus bancos para calcular cuánto te rinde tu dinero',
+        'Escribe la tasa anual y el tope que te da cada banco (revísalos en su app: cambian seguido).',
+        '<button type="button" class="btn primary sm" data-bank-new>+ Agregar banco</button>',
+      )}</div>
+    </div>`;
+  }
+
+  const items = yieldBankItems(d);
+  const height = Math.max(160, items.length * 34 + 40);
+  const estChart =
+    items.length > 0
+      ? `<div class="chart-box" style="height:${height}px"><canvas data-chart="yield-banks" role="img" aria-label="Rendimiento estimado al mes por banco"></canvas></div>`
+      : `<div class="v-money-empty-sm">${emptyState('📈', 'Aún no hay rendimiento estimado', 'Configura la tasa de tus bancos y elige el banco en tus cuentas.')}</div>`;
+
+  return `<div class="card v-money-mybanks" data-mybanks>
+    ${head}
+    <div class="v-money-bk-list">${d.banks.map(bankRowHtml).join('')}</div>
+    ${suggestionsHtml(d)}
+    <div class="grid grid-2 v-money-yield-charts">
+      <div class="v-money-yield-box">
+        <div class="card-head"><h3>Rendimiento estimado al mes por banco</h3></div>
+        ${estChart}
+      </div>
+      <div class="v-money-yield-box" data-registered></div>
+    </div>
+  </div>`;
+}
+
+function bankRowHtml(b: Bank): string {
+  const color = HEX_RE.test(b.color) ? b.color : DEFAULT_COLOR;
+  const earns = bankEarns(b);
+  let capHtml = '';
+  if (b.yield_cap !== null && b.annual_rate > 0) {
+    const cap = b.yield_cap;
+    const ratio = cap > 0 ? b.yield_balance / cap : b.yield_balance > 0 ? 2 : 0;
+    let status: string;
+    if (b.over_cap > 0) {
+      const after = b.rate_above_cap > 0 ? ` (rinde ${rateText(b.rate_above_cap)})` : '';
+      status = `<span class="red">Excedes el tope por ${esc(money(b.over_cap))}: ese dinero ya no rinde ${esc(rateText(b.annual_rate))}${esc(after)}</span>`;
+    } else if ((b.cap_room ?? 0) > 0) {
+      status = `<span class="muted">Te quedan <span class="white num">${esc(money(b.cap_room))}</span> para llegar al tope</span>`;
+    } else {
+      status = '<span class="muted">Estás justo en el tope</span>';
+    }
+    capHtml = `<div>
+      ${progressBar(ratio)}
+      <div class="v-money-cap-foot">${status}<span class="muted num nowrap">${esc(moneyRound(b.yield_balance))} de ${esc(moneyRound(cap))}</span></div>
+    </div>`;
+  }
+  const accountsText = b.accounts_count > 0 ? plural(b.accounts_count, 'cuenta', 'cuentas') : 'Sin cuentas';
+  const info: string[] = [];
+  if (earns) info.push(`Rinde ~<span class="white num">${esc(money(b.est_yield_month))}</span>/mes`);
+  if (earns || b.yield_registered_year > 0) info.push(`Registrado este año: <span class="white num">${esc(money(b.yield_registered_year))}</span>`);
+  return `<div class="v-money-bk">
+    <div class="v-money-bk-top">
+      <span class="dot" style="background:${esc(color)}"></span>
+      <div class="grow">
+        <div class="name" title="${esc(b.name)}">${esc(b.name)}</div>
+        <div class="v-money-bk-terms">${esc(bankTermsText(b))}</div>
+      </div>
+      <div class="v-money-bk-bal">
+        <div class="total num ${b.balance < 0 ? 'red' : 'white'}">${esc(money(b.balance))}</div>
+        <div class="muted tiny">${esc(accountsText)}</div>
+      </div>
+    </div>
+    ${capHtml}
+    <div class="v-money-bk-foot">
+      <span>${info.join(' · ') || '<span class="muted">No genera rendimiento</span>'}</span>
+      <span class="row">
+        <button type="button" class="btn ghost sm" data-bank-edit="${b.id}">Editar</button>
+        <button type="button" class="btn danger sm icon" data-bank-delete="${b.id}" aria-label="Eliminar banco ${esc(b.name)}" title="Eliminar banco">🗑</button>
+      </span>
+    </div>
+  </div>`;
+}
+
+function suggestionsHtml(d: AccountsOverview): string {
+  const list = d.yields.suggestions.slice(0, MAX_SUGGESTIONS);
+  if (list.length === 0) return '';
+  const tips = list
+    .map((s, i) => {
+      const plan = suggestionPlan(s);
+      let action = '';
+      if (!plan.to) {
+        action = `<button type="button" class="btn sm" data-suggest-create="${s.to_bank_id}">Crea una cuenta en ${esc(s.to_bank)}</button>`;
+      } else if (plan.from && plan.from.id !== plan.to.id) {
+        action = `<button type="button" class="btn sm" data-suggest="${i}">Transferir</button>`;
+      }
+      return `<div class="tip v-money-suggest">
+        <span>Mueve <strong class="white num">${esc(money(s.amount))}</strong> de ${esc(s.from_bank)} a ${esc(s.to_bank)}: ganarías ~<strong class="white num">${esc(money(s.extra_year))}</strong> más al año</span>
+        ${action}
+      </div>`;
+    })
+    .join('');
+  return `<div class="v-money-suggests">${tips}</div>`;
+}
+
+/** "Rendimientos registrados por mes" del año seleccionado (se repinta al cambiar de año). */
+function paintRegistered(): void {
+  const d = data;
+  const box = viewRoot?.querySelector<HTMLElement>('[data-registered]');
+  if (!box || !d) return;
+  destroyChart(yieldMonthCanvas);
+  yieldMonthCanvas = null;
+
+  const byMonth = new Map(d.yields.monthly_registered.map((r) => [r.month, Number(r.amount) || 0]));
+  const values = Array.from({ length: 12 }, (_, i) => round2(byMonth.get(i + 1) ?? 0));
+  const any = values.some((v) => Math.abs(v) >= 0.005);
+  box.innerHTML = `
+    <div class="card-head">
+      <h3>Rendimientos registrados por mes</h3>
+      <span class="sub">${esc(d.year)} · <span class="num">${esc(money(d.yields.registered_year))}</span></span>
+    </div>
+    ${
+      any
+        ? `<div class="chart-box sm"><canvas data-chart="yield-monthly" role="img" aria-label="Rendimientos registrados por mes en ${esc(d.year)}"></canvas></div>`
+        : `<div class="v-money-empty-sm">${emptyState('🪙', `Sin rendimientos registrados en ${d.year}`, "Registra lo que te paga tu banco con 'Registrar rendimiento'")}</div>`
+    }`;
+
+  const canvas = box.querySelector<HTMLCanvasElement>('[data-chart="yield-monthly"]');
+  if (!canvas) return;
+  monthlyBars(canvas, [{ label: 'Rendimientos', data: values, color: COLORS.moneySaved }]);
+  yieldMonthCanvas = canvas;
 }
 
 function banksCardHtml(d: AccountsOverview): string {
@@ -394,9 +696,11 @@ function accountsHtml(d: AccountsOverview, active: Account[]): string {
     .filter((g) => g.accounts.length > 0)
     .map((g) => {
       const total = g.total ?? round2(g.accounts.reduce((acc, a) => acc + a.balance, 0));
+      const bank = bankByName(g.label);
+      const rate = bank && bank.annual_rate > 0 ? ` <span class="small v-money-bank-rate">· ${esc(rateText(bank.annual_rate))} anual</span>` : '';
       return `<section class="v-money-bank">
         <div class="v-money-bank-head">
-          <h3>${esc(g.label)} <span class="muted small">· ${esc(plural(g.accounts.length, 'cuenta', 'cuentas'))}</span></h3>
+          <h3>${esc(g.label)} <span class="muted small">· ${esc(plural(g.accounts.length, 'cuenta', 'cuentas'))}</span>${rate}</h3>
           <span class="total num ${total < 0 ? 'red' : 'white'}">${esc(money(total))}</span>
         </div>
         <div class="grid grid-auto">${g.accounts.map((a) => accountCardHtml(a, canTransfer)).join('')}</div>
@@ -409,6 +713,14 @@ function accountsHtml(d: AccountsOverview, active: Account[]): string {
 function accountCardHtml(a: Account, canTransfer: boolean): string {
   const color = HEX_RE.test(a.color) ? a.color : DEFAULT_COLOR;
   const last = a.last_movement_date ? `Último movimiento: ${fmtDate(a.last_movement_date)}` : 'Sin movimientos';
+  const bank = bankById(a.bank_id);
+  const canRegisterYield = !a.archived && !!bank && bank.annual_rate > 0;
+  let yieldLine = '';
+  if (!a.archived && a.est_yield_month > 0) {
+    yieldLine = `<div class="v-money-acc-yield">Rinde ~<span class="white num">${esc(money(a.est_yield_month))}</span>/mes</div>`;
+  } else if (canRegisterYield && !a.earns_yield) {
+    yieldLine = '<div class="v-money-acc-yield muted">No cuenta para el rendimiento de su banco</div>';
+  }
   const actions = a.archived
     ? `<button type="button" class="btn sm" data-restore="${a.id}">Restaurar</button>
        <button type="button" class="btn ghost sm" data-movements="${a.id}">Movimientos</button>
@@ -417,6 +729,7 @@ function accountCardHtml(a: Account, canTransfer: boolean): string {
     : `<button type="button" class="btn primary sm" data-adjust="${a.id}">Ajustar saldo</button>
        <button type="button" class="btn sm" data-movements="${a.id}">Movimientos</button>
        ${canTransfer ? `<button type="button" class="btn sm" data-transfer="${a.id}">Transferir</button>` : ''}
+       ${canRegisterYield ? `<button type="button" class="btn sm" data-yield="${a.id}">Registrar rendimiento</button>` : ''}
        <button type="button" class="btn ghost sm" data-edit="${a.id}">Editar</button>
        <button type="button" class="btn danger sm icon" data-delete="${a.id}" aria-label="Eliminar cuenta" title="Eliminar cuenta">🗑</button>`;
   return `<div class="card v-money-acc ${a.archived ? 'archived' : ''}" style="--acc-color:${color}">
@@ -426,6 +739,7 @@ function accountCardHtml(a: Account, canTransfer: boolean): string {
     </div>
     ${a.archived ? `<div class="muted small">${esc(bankLabel(a))} · Archivada</div>` : ''}
     <div class="v-money-acc-balance num ${a.balance < 0 ? 'red' : 'white'}">${esc(money(a.balance))}</div>
+    ${yieldLine}
     <div class="small muted">Este mes: <span class="white num">+${esc(money(a.inflow_this_month))}</span> / <span class="num ${a.outflow_this_month > 0 ? 'red' : ''}">−${esc(money(a.outflow_this_month))}</span></div>
     <div class="small muted">${esc(last)}</div>
     <div class="row v-money-acc-actions">${actions}</div>
@@ -455,7 +769,28 @@ function bind(wrap: HTMLElement): void {
   });
   on(wrap, 'click', '[data-transfer]', (el) => {
     const a = findAccount(el.dataset.transfer);
-    if (a) openTransferForm(a.id);
+    if (a) openTransferForm({ fromId: a.id });
+  });
+  on(wrap, 'click', '[data-yield]', (el) => {
+    const a = findAccount(el.dataset.yield);
+    if (a) openYieldForm(a);
+  });
+  on(wrap, 'click', '[data-bank-new]', () => openBankForm());
+  on(wrap, 'click', '[data-bank-edit]', (el) => {
+    const b = bankById(Number(el.dataset.bankEdit));
+    if (b) openBankForm(b);
+  });
+  on(wrap, 'click', '[data-bank-delete]', (el) => {
+    const b = bankById(Number(el.dataset.bankDelete));
+    if (b) void deleteBank(b);
+  });
+  on(wrap, 'click', '[data-suggest]', (el) => {
+    const s = data?.yields.suggestions.slice(0, MAX_SUGGESTIONS)[Number(el.dataset.suggest)];
+    if (s) openSuggestedTransfer(s);
+  });
+  on(wrap, 'click', '[data-suggest-create]', (el) => {
+    const b = bankById(Number(el.dataset.suggestCreate));
+    if (b) openAccountForm(undefined, { bankId: b.id });
   });
   on(wrap, 'click', '[data-edit]', (el) => {
     const a = findAccount(el.dataset.edit);
@@ -487,36 +822,42 @@ function setYear(y: number): void {
 // ---------------------------------------------------------------------------
 // Formularios
 // ---------------------------------------------------------------------------
-function bankDatalist(): string {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  const add = (raw: string): void => {
-    const b = (raw ?? '').trim();
-    const k = bankKey(b);
-    if (!b || seen.has(k)) return;
-    seen.add(k);
-    out.push(b);
-  };
-  (data?.items ?? []).forEach((a) => add(a.bank));
-  COMMON_BANKS.forEach(add);
-  return `<datalist id="v-money-banks">${out.map((b) => `<option value="${esc(b)}"></option>`).join('')}</datalist>`;
+/** Opciones del select de banco: sin banco, los bancos, el banco escrito a mano (si no está vinculado) y "+ Nuevo banco…". */
+function bankOptionsHtml(banks: Bank[], selected: string, legacyName: string): string {
+  const opt = (value: string, label: string): string => `<option value="${esc(value)}" ${value === selected ? 'selected' : ''}>${esc(label)}</option>`;
+  return [
+    opt('', 'Sin banco (efectivo)'),
+    legacyName ? opt(KEEP_BANK, `${legacyName} (sin configurar)`) : '',
+    ...banks.map((b) => opt(String(b.id), b.annual_rate > 0 ? `${b.name} · ${rateText(b.annual_rate)} anual` : b.name)),
+    opt(NEW_BANK, '+ Nuevo banco…'),
+  ].join('');
 }
 
-function openAccountForm(acc?: Account): void {
+function openAccountForm(acc?: Account, preset: { bankId?: number } = {}): void {
   const color = acc && HEX_RE.test(acc.color) ? acc.color : DEFAULT_COLOR;
   const kind: AccountKind = acc?.kind ?? 'disponible';
+  const banks = data?.banks ?? [];
+  // Cuenta con banco escrito a mano que no quedó vinculado: se conserva tal cual salvo que el usuario elija otro.
+  const typed = acc && acc.bank_id === null ? acc.bank.trim() : '';
+  const typedMatch = typed ? bankByName(typed) : undefined;
+  const legacyName = typed && !typedMatch ? typed : '';
+  let selectedBank = '';
+  if (acc) selectedBank = acc.bank_id !== null ? String(acc.bank_id) : typedMatch ? String(typedMatch.id) : legacyName ? KEEP_BANK : '';
+  else if (preset.bankId !== undefined && banks.some((b) => b.id === preset.bankId)) selectedBank = String(preset.bankId);
+  const earns = acc ? acc.earns_yield : true;
+
   formModal({
     title: acc ? 'Editar cuenta' : 'Nueva cuenta',
     submitLabel: acc ? 'Guardar cambios' : 'Crear cuenta',
     html: `<form class="form">
       ${field('Nombre', input('name', { value: acc?.name ?? '', placeholder: 'Nómina, Ahorro, Cartera…', required: true }))}
       <div class="form-row">
-        ${field(
-          'Banco',
-          `<input type="text" name="bank" list="v-money-banks" maxlength="60" value="${esc(acc?.bank ?? '')}" placeholder="BBVA, Nu, Mercado Pago…" autocomplete="off" />${bankDatalist()}`,
-          'Déjalo vacío si es efectivo',
-        )}
+        ${field('Banco', `<select name="bank_id" data-bank-select>${bankOptionsHtml(banks, selectedBank, legacyName)}</select>`)}
         ${field('Tipo', select('kind', KINDS.map((k) => ({ value: k, label: ACCOUNT_KIND_LABELS[k], selected: k === kind }))))}
+      </div>
+      <div class="v-money-field-check">
+        <label class="v-money-check"><input type="checkbox" name="earns_yield" ${earns ? 'checked' : ''} /> Genera rendimiento</label>
+        <span class="help">Desmárcalo si esta cuenta no gana intereses</span>
       </div>
       <div class="form-row">
         ${field(

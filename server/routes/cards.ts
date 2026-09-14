@@ -332,6 +332,7 @@ type TxRow = {
   account_name: string | null;
   account_bank: string | null;
   installments: number;
+  recurring_id: number | null;
   created_at: Date | string;
 };
 
@@ -350,7 +351,7 @@ cardsRouter.get('/:id/charges', async (req, res) => {
     `SELECT t.id, t.type, t.amount, t.category_id,
             c.name AS category_name, c.color AS category_color, c.icon AS category_icon,
             t.description, t.date, t.credit_card_id, cc.name AS card_name,
-            t.account_id, a.name AS account_name, a.bank AS account_bank, t.installments, t.created_at
+            t.account_id, a.name AS account_name, a.bank AS account_bank, t.installments, t.recurring_id, t.created_at
        FROM transactions t
        LEFT JOIN categories c ON c.id = t.category_id
        LEFT JOIN credit_cards cc ON cc.id = t.credit_card_id
@@ -376,6 +377,7 @@ cardsRouter.get('/:id/charges', async (req, res) => {
     account_name: r.account_name ?? null,
     account_bank: r.account_bank ?? null,
     installments: Math.max(1, Number(r.installments) || 1),
+    recurring_id: r.recurring_id ?? null,
     created_at: toIso(r.created_at),
   }));
   res.json(items);

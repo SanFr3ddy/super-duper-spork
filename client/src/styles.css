@@ -1152,8 +1152,8 @@ td.actions {
   .nav a {
     flex-direction: column;
     gap: 2px;
-    padding: 6px 4px;
-    font-size: 0.62rem;
+    padding: 6px 2px;
+    font-size: 0.58rem;
     flex: 1;
     min-width: 0;
     text-align: center;
@@ -1164,7 +1164,7 @@ td.actions {
     color: var(--red);
   }
   .nav .ico {
-    font-size: 1.15rem;
+    font-size: 1.05rem;
   }
   .nav .label-full {
     display: none;

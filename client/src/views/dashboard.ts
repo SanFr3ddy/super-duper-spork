@@ -1,6 +1,8 @@
 /**
  * Vista "Resumen": dashboard anual con gráficas por mes, mes actual, hábitos y accesos a las secciones.
  * "Flujo neto" = ingresos − gastos − préstamos − ahorro. "Disponible" = dinero en cuentas (Mi dinero).
+ * Mi dinero incluye el rendimiento estimado de los bancos y el dinero por encima de sus topes; "Próximos cargos"
+ * muestra los cargos recurrentes (suscripciones) de los próximos 30 días.
  */
 import type { CategoryTotal, DashboardYear, Transaction } from '../../../shared/types';
 import { api, qs } from '../api';
@@ -52,6 +54,27 @@ const STYLE = `<style>
 .v-dash .money-bank .progress{grid-column:1/-1}
 .v-dash .money-empty{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px}
 @media (max-width:820px){.v-dash .money-layout{grid-template-columns:1fr}}
+.v-dash .grid>.card+.card{margin-top:0}
+.v-dash .dash-top{grid-template-columns:minmax(0,1.75fr) minmax(0,1fr);align-items:stretch}
+.v-dash .dash-top>.card{min-width:0}
+@media (max-width:1280px){.v-dash .dash-top{grid-template-columns:1fr}}
+.v-dash .dash-yield{color:var(--text-2)}
+.v-dash .dash-over{display:flex;flex-direction:column;gap:4px;padding:10px 12px;border:1px solid var(--red);border-radius:var(--radius-sm);background:var(--red-soft)}
+.v-dash .dash-over .red{font-weight:600}
+.v-dash .dash-over a{color:var(--white);font-weight:600;text-decoration:none;overflow-wrap:anywhere}
+.v-dash .dash-over a:hover{text-decoration:underline}
+.v-dash .dash-rec{display:flex;flex-direction:column;gap:10px}
+.v-dash .dash-rec .card-head{margin-bottom:0}
+.v-dash .dash-rec-totals{display:flex;flex-wrap:wrap;gap:6px 24px;align-items:flex-end}
+.v-dash .dash-rec-totals>div{min-width:0}
+.v-dash .dash-rec-totals .big{overflow-wrap:anywhere}
+.v-dash .dash-rec-list .list-item{padding:9px 0;gap:10px}
+.v-dash .dash-rec-list .icon-box{width:34px;height:34px;font-size:1rem}
+.v-dash .dash-rec-list .meta{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.v-dash .dash-rec-foot{margin-top:auto;padding-top:4px}
+.v-dash .dash-rec-foot a{text-decoration:none}
+.v-dash .dash-rec-empty{display:flex;flex-direction:column;align-items:flex-start;gap:10px;padding:6px 0}
+.v-dash .dash-auto{margin-right:2px}
 </style>`;
 
 // ---------------------------------------------------------------------------
@@ -166,7 +189,10 @@ function draw(root: HTMLElement, d: DashboardYear): void {
       ${statTile('Flujo neto del año', money(d.totals.net), netCls, bestWorst)}
     </div>
 
-    ${moneyCard(d)}
+    <div class="grid dash-top row-gap">
+      ${moneyCard(d)}
+      ${recurringCard(d)}
+    </div>
 
     <div class="grid grid-2 row-gap">
       <div class="card">
@@ -346,8 +372,21 @@ function habitsHtml(d: DashboardYear): string {
     if (m.accounts_count > 0 && cm.expenses > 0 && m.disponible < cm.expenses) {
       items.push({ icon: '🏦', text: `Tu dinero disponible (${money(m.disponible)}) es menor que tus gastos de este mes.` });
     }
+    const fixed = d.recurring.monthly_expense;
+    if (fixed > 0 && cm.income > 0 && fixed / cm.income >= 0.3) {
+      items.push({ icon: '🔁', text: `Tus cargos fijos se llevan el ${pct(fixed / cm.income)} de tus ingresos del mes.` });
+    }
     if (d.cards.installments_due_this_month > 0) {
       items.push({ icon: '🗓️', text: `Este mes pagas ${money(d.cards.installments_due_this_month)} de compras a meses.` });
+    }
+    if (m.over_cap_total > 0) {
+      const s = m.top_suggestion;
+      items.push({
+        icon: '📈',
+        text: s
+          ? `Tienes ${money(s.amount)} sin rendir en ${s.from_bank}: muévelo a ${s.to_bank}.`
+          : `Tienes ${money(m.over_cap_total)} por encima de tus topes de rendimiento.`,
+      });
     }
     if (d.cards.utilization > 0.3) {
       items.push({ icon: '💳', text: `Tu utilización de crédito es ${pct(d.cards.utilization)}; procura mantenerla bajo 30%.` });
@@ -496,7 +535,7 @@ function moneyCard(d: DashboardYear): string {
   const m = d.money;
   const head = `<div class="card-head"><h2>💰 Mi dinero <span class="sub">saldo a hoy</span></h2><a class="btn ghost sm" href="#/dinero">Ver →</a></div>`;
   if (m.accounts_count === 0) {
-    return `<div class="card row-gap">
+    return `<div class="card">
       ${head}
       <div class="money-empty">
         <div>
@@ -521,7 +560,23 @@ function moneyCard(d: DashboardYear): string {
           </div>`,
           )
           .join('');
-  return `<div class="card row-gap">
+  const yieldHtml =
+    m.est_yield_month > 0
+      ? `<div class="small dash-yield">Rinde <span class="num white bold">~${esc(money(m.est_yield_month))}</span>/mes <span class="muted">· ~${esc(money(m.est_yield_year))}/año</span></div>`
+      : '';
+  const s = m.top_suggestion;
+  const overHtml =
+    m.over_cap_total > 0
+      ? `<div class="dash-over small">
+          <span class="red">Tienes ${esc(money(m.over_cap_total))} por encima de tus topes de rendimiento</span>
+          ${
+            s
+              ? `<a href="#/dinero">Muévelos a ${esc(s.to_bank)}: +${esc(money(s.extra_year))}/año →</a>`
+              : '<a href="#/dinero">Revisa tus bancos →</a>'
+          }
+        </div>`
+      : '';
+  return `<div class="card">
     ${head}
     <div class="money-layout">
       <div class="money-main">
@@ -529,16 +584,74 @@ function moneyCard(d: DashboardYear): string {
           <div class="stat-label">Total en cuentas</div>
           <div class="money-total ${m.total < 0 ? 'red' : 'white'}">${esc(money(m.total))}</div>
           <div class="muted small">${m.accounts_count} ${m.accounts_count === 1 ? 'cuenta' : 'cuentas'}</div>
+          ${yieldHtml}
         </div>
         <div class="money-split">
           <div><div class="stat-label">Disponible</div><div class="val ${m.disponible < 0 ? 'red' : 'white'}">${esc(money(m.disponible))}</div></div>
           <div><div class="stat-label">Guardado</div><div class="val ${m.guardado < 0 ? 'red' : ''}">${esc(money(m.guardado))}</div></div>
         </div>
+        ${overHtml}
       </div>
       <div class="money-banks">
         <div class="stat-label">Por banco</div>
         ${banksHtml}
       </div>
+    </div>
+  </div>`;
+}
+
+/** "hoy", "mañana", "en N días" (o "hace N días" si ya pasó). */
+function whenLabel(iso: string): string {
+  const days = daysUntil(iso);
+  if (days < 0) return days === -1 ? 'ayer' : `hace ${-days} días`;
+  return days === 0 ? 'hoy' : days === 1 ? 'mañana' : `en ${days} días`;
+}
+
+function recurringCard(d: DashboardYear): string {
+  const r = d.recurring;
+  const head = `<div class="card-head"><h2>🔁 Próximos cargos <span class="sub">30 días</span></h2></div>`;
+  if (r.active === 0) {
+    return `<div class="card dash-rec">
+      ${head}
+      <div class="dash-rec-empty">
+        <p class="bold white">Registra tus suscripciones y pagos fijos</p>
+        <p class="muted small">Netflix, renta, gimnasio o tu nómina: se registran solos cada mes, semana o año.</p>
+        <a class="btn primary" href="#/suscripciones">Agregar suscripción</a>
+      </div>
+    </div>`;
+  }
+  const list =
+    r.upcoming.length === 0
+      ? '<p class="muted small">Sin cargos en los próximos 30 días.</p>'
+      : `<div class="list dash-rec-list">${r.upcoming
+          .map((u) => {
+            const isIncome = u.type === 'income';
+            const icon = u.category_icon || (isIncome ? '💰' : '🔁');
+            const meta = [`${fmtDateShort(u.date)} · ${whenLabel(u.date)}`, u.payment_label].filter(Boolean).join(' · ');
+            return `<div class="list-item">
+              <div class="icon-box">${esc(icon)}</div>
+              <div class="grow"><div class="name" title="${esc(u.name)}">${esc(u.name)}</div><div class="meta" title="${esc(meta)}">${esc(meta)}</div></div>
+              <span class="amt amount ${isIncome ? 'income' : 'expense'}">${esc(moneySigned(isIncome ? u.amount : -u.amount))}</span>
+            </div>`;
+          })
+          .join('')}</div>`;
+  return `<div class="card dash-rec">
+    ${head}
+    <div class="dash-rec-totals">
+      <div>
+        <div class="stat-label">Cargos fijos</div>
+        <div class="big ${r.monthly_expense > 0 ? 'red' : 'white'}">${esc(money(r.monthly_expense))}<span class="muted small">/mes</span></div>
+      </div>
+      ${
+        r.monthly_income > 0
+          ? `<div><div class="stat-label">Ingresos fijos</div><div class="bold white num">${esc(money(r.monthly_income))}<span class="muted small">/mes</span></div></div>`
+          : ''
+      }
+    </div>
+    ${list}
+    <div class="dash-rec-foot row between small">
+      <span class="muted">${r.active} ${r.active === 1 ? 'cargo activo' : 'cargos activos'}</span>
+      <a class="btn ghost sm" href="#/suscripciones">Ver suscripciones →</a>
     </div>
   </div>`;
 }
@@ -556,7 +669,7 @@ function recentHtml(items: Transaction[]): string {
         const meta = [fmtDateShort(t.date), t.category_name ?? 'Sin categoría', sourceLabel(t)].filter(Boolean).join(' · ');
         return `<div class="list-item">
           <div class="icon-box">${esc(icon)}</div>
-          <div class="grow"><div class="name">${esc(title)}</div><div class="meta">${esc(meta)}</div></div>
+          <div class="grow"><div class="name">${esc(title)}</div><div class="meta">${t.recurring_id != null ? '<span class="dash-auto" title="Registrado por un cargo recurrente" aria-label="Cargo recurrente">🔁</span> ' : ''}${esc(meta)}</div></div>
           <span class="amt amount ${isIncome ? 'income' : 'expense'}">${esc(moneySigned(isIncome ? t.amount : -t.amount))}</span>
         </div>`;
       })

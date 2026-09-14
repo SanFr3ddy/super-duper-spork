@@ -47,6 +47,9 @@ const STYLE = `<style>
   .v-tx .v-tx-filters > select,
   .v-tx .v-tx-filters > input[type='search'] { width: auto; flex: 1 1 190px; min-width: 160px; }
   .v-tx .v-tx-desc { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .v-tx .v-tx-desc-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .v-tx .v-tx-desc-row .v-tx-desc { min-width: 0; }
+  .v-tx .v-tx-auto { flex: none; padding: 1px 7px; font-size: 0.7rem; }
   .v-tx td.actions .btn + .btn { margin-left: 2px; }
   .v-tx .stat-value.white { color: var(--white); }
   .v-tx .v-tx-pay { display: inline-block; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
@@ -317,7 +320,11 @@ function rowHtml(t: Transaction): string {
       : `<span class="muted small">Sin categoría</span>`;
   return `<tr>
     <td class="nowrap">${esc(fmtDateShort(t.date))}</td>
-    <td><div class="v-tx-desc" title="${esc(t.description)}">${desc}</div></td>
+    <td>${
+      t.recurring_id != null
+        ? `<div class="v-tx-desc-row"><div class="v-tx-desc" title="${esc(t.description)}">${desc}</div><span class="chip v-tx-auto" title="Registrado automáticamente por un cargo recurrente">🔁 Automático</span></div>`
+        : `<div class="v-tx-desc" title="${esc(t.description)}">${desc}</div>`
+    }</td>
     <td class="nowrap">${cat}</td>
     <td class="nowrap">${payHtml(t)}</td>
     <td class="amount ${isExpense ? 'expense' : 'income'}">${isExpense ? '-' : '+'}${money(t.amount)}</td>

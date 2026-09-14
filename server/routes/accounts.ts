@@ -5,7 +5,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { one, query } from '../db.js';
-import { accountTotals, bankTotals, loadAccounts, monthlyBalances } from '../accountsData.js';
+import { accountTotals, bankTotals, loadAccounts, loadBanks, monthlyBalances, yieldsSummary } from '../accountsData.js';
 import { HttpError, notFound, parseId, round2, todayISO, validate, zColor, zDate, zMoney, zName, zNote } from '../util.js';
 import type { Account, AccountMovement, AccountMovementSource, AccountsOverview, Transfer } from '../../shared/types.js';
 
@@ -15,9 +15,11 @@ const MAX_ABS = 999_999_999_999;
 const zKind = z.enum(['disponible', 'ahorro', 'inversion', 'efectivo']);
 const zSigned = z.number().finite().min(-MAX_ABS, 'Monto demasiado grande').max(MAX_ABS, 'Monto demasiado grande');
 
+// 'bank' (texto) ya no se acepta: el nombre lo pone el servidor a partir de bank_id. Zod descarta claves desconocidas.
 const accountSchema = z.object({
   name: zName,
-  bank: z.string().trim().max(60, 'Máximo 60 caracteres').optional(),
+  bank_id: z.number().int().positive().nullable().optional(),
+  earns_yield: z.boolean().optional(),
   kind: zKind,
   opening_balance: zSigned,
   opening_date: zDate.optional(),
@@ -30,6 +32,25 @@ const adjustSchema = z.object({
   date: zDate.optional(),
   note: zNote.optional(),
 });
+
+const yieldSchema = z.object({
+  amount: zMoney,
+  date: zDate.optional(),
+  note: zNote.optional(),
+});
+
+/** 400 si el banco no existe (null = sin banco). */
+async function assertBankExists(bankId: number | null): Promise<void> {
+  if (bankId === null) return;
+  const bank = await one<{ id: number }>('SELECT id FROM banks WHERE id = $1', [bankId]);
+  if (!bank) throw new HttpError(400, 'El banco no existe');
+}
+
+/**
+ * SQL para accounts.bank (copia de banks.name) a partir del parámetro $n con bank_id; '' sin banco.
+ * Se lee en la misma sentencia que guarda bank_id, así un renombre concurrente no deja el nombre desfasado.
+ */
+const bankNameSql = (n: number): string => `COALESCE((SELECT b.name FROM banks b WHERE b.id = $${n}::int), '')`;
 
 const transferSchema = z.object({
   from_account_id: z.number().int().positive(),
@@ -58,8 +79,9 @@ function parseYear(raw: unknown): number {
 accountsRouter.get('/', async (req, res) => {
   const year = parseYear(req.query.year);
   const items = await loadAccounts();
-  const [monthly, yearRows] = await Promise.all([
+  const [monthly, banks, yearRows] = await Promise.all([
     monthlyBalances(year, items),
+    loadBanks(items),
     query<{ y: number }>(
       `SELECT DISTINCT EXTRACT(YEAR FROM d)::int AS y FROM (
          SELECT opening_date AS d FROM accounts
@@ -77,6 +99,8 @@ accountsRouter.get('/', async (req, res) => {
     by_bank: bankTotals(items),
     monthly,
     available_years: [...years].filter(Number.isInteger).sort((a, b) => b - a),
+    banks,
+    yields: await yieldsSummary(banks, year),
   };
   res.json(body);
 });
@@ -114,10 +138,21 @@ accountsRouter.delete('/transfers/:id', async (req, res) => {
 // ---------------------------------------------------------------------------
 accountsRouter.post('/', async (req, res) => {
   const data = validate(accountSchema, req.body);
+  const bankId = data.bank_id ?? null;
+  await assertBankExists(bankId);
   const row = await one<{ id: number }>(
-    `INSERT INTO accounts (name, bank, kind, opening_balance, opening_date, color, archived)
-     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-    [data.name, data.bank ?? '', data.kind, round2(data.opening_balance), data.opening_date ?? todayISO(), data.color ?? '#e5202e', data.archived ?? false],
+    `INSERT INTO accounts (name, bank, bank_id, earns_yield, kind, opening_balance, opening_date, color, archived)
+     VALUES ($1, ${bankNameSql(2)}, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+    [
+      data.name,
+      bankId,
+      data.earns_yield ?? true,
+      data.kind,
+      round2(data.opening_balance),
+      data.opening_date ?? todayISO(),
+      data.color ?? '#e5202e',
+      data.archived ?? false,
+    ],
   );
   res.status(201).json(await loadAccount(row!.id));
 });
@@ -132,7 +167,12 @@ accountsRouter.put('/:id', async (req, res) => {
     sets.push(`${col} = $${params.length}`);
   };
   if (data.name !== undefined) add('name', data.name);
-  if (data.bank !== undefined) add('bank', data.bank);
+  if (data.bank_id !== undefined) {
+    await assertBankExists(data.bank_id);
+    add('bank_id', data.bank_id);
+    sets.push(`bank = ${bankNameSql(params.length)}`);
+  }
+  if (data.earns_yield !== undefined) add('earns_yield', data.earns_yield);
   if (data.kind !== undefined) add('kind', data.kind);
   if (data.opening_balance !== undefined) add('opening_balance', round2(data.opening_balance));
   if (data.opening_date !== undefined) add('opening_date', data.opening_date);
@@ -168,9 +208,31 @@ accountsRouter.post('/:id/adjust', async (req, res) => {
   const [asOf] = await loadAccounts({ id, asOf: date });
   const delta = round2(data.balance - asOf.balance);
   if (Math.abs(delta) >= 0.01) {
-    await query('INSERT INTO balance_adjustments (account_id, amount, date, note) VALUES ($1, $2, $3, $4)', [id, delta, date, data.note ?? '']);
+    await query("INSERT INTO balance_adjustments (account_id, amount, date, note, source) VALUES ($1, $2, $3, $4, 'ajuste')", [
+      id,
+      delta,
+      date,
+      data.note ?? '',
+    ]);
   }
   res.json(await loadAccount(id));
+});
+
+// Rendimiento pagado por el banco (intereses): se guarda como ajuste con source='rendimiento'
+accountsRouter.post('/:id/yield', async (req, res) => {
+  const id = parseId(req.params.id);
+  const data = validate(yieldSchema, req.body);
+  const date = data.date ?? todayISO();
+  const base = await one<{ opening_date: string }>('SELECT opening_date FROM accounts WHERE id = $1', [id]);
+  if (!base) throw notFound('Cuenta');
+  if (date < base.opening_date) throw new HttpError(400, 'La fecha del rendimiento no puede ser anterior a la fecha de apertura de la cuenta');
+  await query("INSERT INTO balance_adjustments (account_id, amount, date, note, source) VALUES ($1, $2, $3, $4, 'rendimiento')", [
+    id,
+    round2(data.amount),
+    date,
+    data.note ?? '',
+  ]);
+  res.status(201).json(await loadAccount(id));
 });
 
 accountsRouter.delete('/:id/adjustments/:adjustmentId', async (req, res) => {
@@ -216,7 +278,9 @@ accountsRouter.get('/:id/movements', async (req, res) => {
        FROM transfers tr JOIN accounts ta ON ta.id = tr.to_account_id
       WHERE tr.from_account_id = $1
      UNION ALL
-     SELECT 'adjustment', b.id, b.date, 'Ajuste de saldo' || CASE WHEN b.note <> '' THEN ' · ' || b.note ELSE '' END, b.amount, b.created_at
+     SELECT CASE WHEN b.source = 'rendimiento' THEN 'yield' ELSE 'adjustment' END, b.id, b.date,
+            CASE WHEN b.source = 'rendimiento' THEN 'Rendimiento' ELSE 'Ajuste de saldo' END || CASE WHEN b.note <> '' THEN ' · ' || b.note ELSE '' END,
+            b.amount, b.created_at
        FROM balance_adjustments b
       WHERE b.account_id = $1`,
     [id],
@@ -232,6 +296,7 @@ accountsRouter.get('/:id/movements', async (req, res) => {
     transfer_in: 'tr',
     transfer_out: 'tr',
     adjustment: 'adj',
+    yield: 'adj',
   };
   const events = rows
     .filter((r) => r.date >= acc.opening_date)
