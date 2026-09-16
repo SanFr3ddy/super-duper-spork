@@ -40,6 +40,7 @@ type AccountRow = {
   bank: string;
   bank_id: number | null;
   earns_yield: boolean;
+  yield_accrued_until: string | null;
   kind: AccountKind;
   opening_balance: number;
   opening_date: string;
@@ -60,12 +61,14 @@ type BankRow = {
   annual_rate: number;
   yield_cap: number | null;
   rate_above_cap: number;
+  auto_yield: boolean;
+  rate_since: string | null;
   created_at: Date | string;
 };
 
 async function loadBankRows(): Promise<BankRow[]> {
   return query<BankRow>(
-    'SELECT id, name, color, annual_rate, yield_cap, rate_above_cap, created_at FROM banks ORDER BY lower(name) ASC, id ASC',
+    'SELECT id, name, color, annual_rate, yield_cap, rate_above_cap, auto_yield, rate_since, created_at FROM banks ORDER BY lower(name) ASC, id ASC',
   );
 }
 
@@ -104,10 +107,10 @@ export async function loadAccounts(opts: { id?: number; asOf?: string } = {}): P
   const asOf = opts.asOf ?? todayISO();
   const [y, m] = asOf.split('-').map(Number);
   const { from: monthStart } = monthRange(y, m);
-  const [rows, bankRows] = await Promise.all([
+  const [rows, bankRows, lastAuto] = await Promise.all([
     query<AccountRow>(
       `WITH ${ACCOUNT_EVENTS_CTE}
-       SELECT a.id, a.name, a.bank, a.bank_id, a.earns_yield, a.kind, a.opening_balance, a.opening_date, a.color, a.archived, a.created_at,
+       SELECT a.id, a.name, a.bank, a.bank_id, a.earns_yield, a.yield_accrued_until, a.kind, a.opening_balance, a.opening_date, a.color, a.archived, a.created_at,
               COALESCE(SUM(ev.delta) FILTER (WHERE ev.date >= a.opening_date AND ev.date <= $1::date), 0) AS delta_to_date,
               COALESCE(SUM(ev.delta) FILTER (WHERE ev.delta > 0 AND ev.date >= GREATEST(a.opening_date, $2::date) AND ev.date <= $1::date), 0) AS inflow_month,
               COALESCE(-SUM(ev.delta) FILTER (WHERE ev.delta < 0 AND ev.date >= GREATEST(a.opening_date, $2::date) AND ev.date <= $1::date), 0) AS outflow_month,
@@ -122,6 +125,7 @@ export async function loadAccounts(opts: { id?: number; asOf?: string } = {}): P
       [asOf, monthStart, opts.id ?? null],
     ),
     loadBankRows(),
+    lastAutoYields(),
   ]);
   const accounts: Account[] = rows.map((r) => ({
     id: r.id,
@@ -129,6 +133,8 @@ export async function loadAccounts(opts: { id?: number; asOf?: string } = {}): P
     bank: r.bank ?? '',
     bank_id: r.bank_id ?? null,
     earns_yield: !!r.earns_yield,
+    yield_accrued_until: r.yield_accrued_until ?? null,
+    last_auto_yield: lastAuto.get(r.id) ?? null,
     kind: r.kind,
     opening_balance: round2(Number(r.opening_balance) || 0),
     opening_date: r.opening_date,
@@ -163,6 +169,17 @@ export async function loadAccounts(opts: { id?: number; asOf?: string } = {}): P
   }
 
   return opts.id === undefined ? accounts : accounts.filter((a) => a.id === opts.id);
+}
+
+/** Abono automático más reciente por cuenta (fecha y monto). */
+async function lastAutoYields(): Promise<Map<number, { date: string; amount: number }>> {
+  const rows = await query<{ account_id: number; date: string; amount: number }>(
+    `SELECT DISTINCT ON (account_id) account_id, date, amount
+       FROM balance_adjustments
+      WHERE auto
+      ORDER BY account_id, date DESC, id DESC`,
+  );
+  return new Map(rows.map((r) => [Number(r.account_id), { date: r.date, amount: round2(Number(r.amount) || 0) }]));
 }
 
 /** Año calendario (YYYY) de una fecha 'YYYY-MM-DD'. */
@@ -201,6 +218,8 @@ export async function loadBanks(accounts?: Account[]): Promise<Bank[]> {
       annual_rate: t.annual_rate,
       yield_cap: t.yield_cap,
       rate_above_cap: t.rate_above_cap,
+      auto_yield: !!r.auto_yield,
+      rate_since: r.rate_since ?? null,
       created_at: iso(r.created_at),
       accounts_count: mine.length,
       balance: round2(mine.reduce((acc, a) => acc + a.balance, 0)),
@@ -212,8 +231,18 @@ export async function loadBanks(accounts?: Account[]): Promise<Bank[]> {
       est_yield_year: est.year,
       effective_rate: est.effective_rate,
       yield_registered_year: round2(registeredByBank.get(r.id) ?? 0),
+      last_auto_yield: lastBankAuto(mine),
     };
   });
+}
+
+/** Último día con abono automático en las cuentas de un banco y la suma abonada ese día. */
+function lastBankAuto(accounts: Account[]): { date: string; amount: number } | null {
+  let date: string | null = null;
+  for (const a of accounts) if (a.last_auto_yield && (!date || a.last_auto_yield.date > date)) date = a.last_auto_yield.date;
+  if (!date) return null;
+  const amount = accounts.reduce((acc, a) => acc + (a.last_auto_yield && a.last_auto_yield.date === date ? a.last_auto_yield.amount : 0), 0);
+  return { date, amount: round2(amount) };
 }
 
 /** Resumen de rendimientos de todos los bancos; lo registrado corresponde al año `year`. */

@@ -18,7 +18,10 @@ import { dashboardRouter } from './routes/dashboard.js';
 import { accountsRouter } from './routes/accounts.js';
 import { banksRouter } from './routes/banks.js';
 import { recurringRouter } from './routes/recurring.js';
-import { autoPostRecurring, startRecurringTimer } from './recurringPost.js';
+import { autoDailyJobs, startDailyJobsTimer } from './dailyJobs.js';
+import { quickAuth } from './apiTokens.js';
+import { tokensRouter } from './routes/tokens.js';
+import { quickRouter } from './routes/quick.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 3000;
@@ -48,11 +51,13 @@ app.get('/api/config', (_req, res) => {
   res.json(body);
 });
 app.use('/api/auth', authRouter);
+// API rápida para Atajos de iPhone: acepta token Bearer (o sesión). Va antes de requireAuth.
+app.use('/api/quick', quickAuth, autoDailyJobs, quickRouter);
 
 // --- API protegida ---
 app.use('/api', requireAuth);
-// Registra cargos recurrentes vencidos (máx. cada 5 min) antes de responder, para que todo lo leído esté al día.
-app.use('/api', autoPostRecurring);
+// Cargos recurrentes vencidos y rendimientos diarios (máx. cada 5 min) antes de responder, para que todo esté al día.
+app.use('/api', autoDailyJobs);
 app.use('/api', (_req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   next();
@@ -67,6 +72,7 @@ app.use('/api/dashboard', dashboardRouter);
 app.use('/api/accounts', accountsRouter);
 app.use('/api/banks', banksRouter);
 app.use('/api/recurring', recurringRouter);
+app.use('/api/tokens', tokensRouter);
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Ruta no encontrada' }));
 app.use(errorHandler);
 
@@ -103,7 +109,7 @@ app.use((req, res) => {
 
 async function main(): Promise<void> {
   await ensureSchema();
-  startRecurringTimer();
+  startDailyJobsTimer();
   app.listen(PORT, () => {
     console.log(`[server] escuchando en http://localhost:${PORT} (${IS_PROD ? 'producción' : 'desarrollo'})`);
   });

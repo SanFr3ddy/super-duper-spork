@@ -493,6 +493,14 @@ export interface DashboardYear {
 //  - Rendimiento anual estimado = min(saldo, tope) * annual_rate/100 + max(0, saldo - tope) * rate_above_cap/100
 //    (sin tope: saldo * annual_rate/100). Mensual = anual/12; diario = anual/365. Interés simple, es una ESTIMACIÓN.
 //  - Por cuenta: parte proporcional a su saldo (si earns_yield y saldo > 0).
+//  - ABONO DIARIO AUTOMÁTICO (server/yieldAccrual.ts), bancos con auto_yield y tasa > 0:
+//    cada día completo d (hasta AYER) se abona a cada cuenta que rinde su parte del rendimiento diario del banco
+//    (anual/365 sobre el saldo que rinde al cierre de d, que ya incluye abonos previos => interés compuesto diario,
+//    respetando el tope). Se guarda en balance_adjustments (source='rendimiento', auto=true, nota "Rendimiento del
+//    día"), uno por cuenta y día (índice único). Los centavos sobrantes se acumulan en accounts.yield_carry.
+//    Empieza en max(opening_date de la cuenta, banks.rate_since, yield_accrued_until + 1). rate_since = hoy cuando
+//    un banco pasa de tasa 0 a > 0 o se activa auto_yield; cambiar el banco de una cuenta o activar earns_yield
+//    empieza a contar desde hoy. Se ejecuta al arrancar, cada hora y como máximo cada 5 min con peticiones.
 //  - Sugerencias: el dinero por encima del tope de un banco (que rinde rate_above_cap) se sugiere mover a bancos con
 //    mayor tasa y espacio bajo su tope (o sin tope), en orden de tasa desc; solo si gana >= $1 al año.
 // ---------------------------------------------------------------------------
@@ -503,6 +511,8 @@ export interface Bank {
   annual_rate: number; // % anual, p. ej. 15
   yield_cap: number | null; // monto máximo que genera annual_rate; null = sin tope
   rate_above_cap: number; // % anual para lo que exceda el tope (normalmente 0)
+  auto_yield: boolean; // abonar el rendimiento automáticamente cada día
+  rate_since: string | null; // día desde el que se abona automáticamente
   created_at: string;
   // calculados (a hoy, cuentas no archivadas)
   accounts_count: number;
@@ -515,10 +525,12 @@ export interface Bank {
   est_yield_year: number;
   effective_rate: number; // % anual efectivo sobre yield_balance (annual_rate si yield_balance = 0)
   yield_registered_year: number; // rendimientos registrados en el año actual en sus cuentas
+  last_auto_yield: { date: string; amount: number } | null; // último día abonado automáticamente (suma de sus cuentas)
 }
 export interface BankInput {
   name: string;
   color?: string;
+  auto_yield?: boolean; // por defecto true
   annual_rate: number; // 0..1000
   yield_cap?: number | null;
   rate_above_cap?: number;
@@ -572,6 +584,8 @@ export interface Account {
   // calculados (a hoy)
   balance: number;
   est_yield_month: number; // parte proporcional del rendimiento mensual estimado de su banco
+  yield_accrued_until: string | null; // último día con rendimiento abonado automáticamente
+  last_auto_yield: { date: string; amount: number } | null; // abono automático más reciente
   inflow_this_month: number; // entradas del mes actual (ingresos, transferencias recibidas, ajustes +)
   outflow_this_month: number; // salidas del mes actual (positivo)
   last_movement_date: string | null;
@@ -778,4 +792,46 @@ export interface RecurringOverview {
     next_30_days_expense: number;
   };
   upcoming: UpcomingCharge[]; // próximos 30 días
+}
+
+// ---------------------------------------------------------------------------
+// Registro rápido desde fuera de la web (Atajos de iPhone / Siri / widgets)
+//  Tokens (requieren sesión normal):
+//  GET    /api/tokens                        -> ApiToken[]
+//  POST   /api/tokens                        { name } -> ApiTokenCreated (el token completo SOLO se muestra aquí)
+//  DELETE /api/tokens/:id                    -> { ok: true }
+//  API rápida (autenticación: cabecera "Authorization: Bearer <token>"; también acepta sesión normal):
+//  GET    /api/quick/options                 -> QuickOptions (listas de nombres para menús del Atajo)
+//  POST   /api/quick/transaction             QuickTransactionInput -> QuickResult
+//  GET    /api/quick/summary                 -> QuickResult (texto con tu dinero, gastos de hoy y del mes)
+//  El token NO da acceso al resto de /api. Se guarda hasheado (SHA-256); se muestra una sola vez.
+// ---------------------------------------------------------------------------
+export interface ApiToken {
+  id: number;
+  name: string;
+  prefix: string; // primeros caracteres para reconocerlo
+  created_at: string;
+  last_used_at: string | null;
+}
+export interface ApiTokenCreated extends ApiToken {
+  token: string;
+}
+export interface QuickOptions {
+  categories_expense: string[];
+  categories_income: string[];
+  payments: string[]; // "Efectivo", "Revolut", "DiDi · Ahorro DiDi", "Tarjeta BBVA"... (nombres aceptados en payment)
+}
+export interface QuickTransactionInput {
+  type?: TxType | 'gasto' | 'ingreso'; // por defecto gasto
+  amount: number | string; // acepta "150", "150.50", "$1,250.00"
+  description?: string;
+  category?: string; // nombre (sin distinguir mayúsculas/acentos); si no existe => sin categoría
+  payment?: string; // nombre de cuenta, "Banco · Cuenta", nombre de tarjeta o "Tarjeta X"; vacío => sin especificar
+  date?: string; // YYYY-MM-DD; por defecto hoy
+}
+export interface QuickResult {
+  ok: boolean;
+  message: string; // texto listo para "Mostrar notificación"
+  transaction_id?: number;
+  balance?: number | null; // saldo de la cuenta usada (si aplica)
 }

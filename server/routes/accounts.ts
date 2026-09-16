@@ -141,8 +141,8 @@ accountsRouter.post('/', async (req, res) => {
   const bankId = data.bank_id ?? null;
   await assertBankExists(bankId);
   const row = await one<{ id: number }>(
-    `INSERT INTO accounts (name, bank, bank_id, earns_yield, kind, opening_balance, opening_date, color, archived)
-     VALUES ($1, ${bankNameSql(2)}, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+    `INSERT INTO accounts (name, bank, bank_id, earns_yield, kind, opening_balance, opening_date, color, archived, yield_accrued_until)
+     VALUES ($1, ${bankNameSql(2)}, $2, $3, $4, $5, $6, $7, $8, ($9::date - 1)) RETURNING id`,
     [
       data.name,
       bankId,
@@ -152,6 +152,7 @@ accountsRouter.post('/', async (req, res) => {
       data.opening_date ?? todayISO(),
       data.color ?? '#e5202e',
       data.archived ?? false,
+      todayISO(), // el saldo capturado ya incluye rendimientos pasados: el abono automático empieza hoy
     ],
   );
   res.status(201).json(await loadAccount(row!.id));
@@ -173,6 +174,14 @@ accountsRouter.put('/:id', async (req, res) => {
     sets.push(`bank = ${bankNameSql(params.length)}`);
   }
   if (data.earns_yield !== undefined) add('earns_yield', data.earns_yield);
+  const prev = await one<{ bank_id: number | null; earns_yield: boolean }>('SELECT bank_id, earns_yield FROM accounts WHERE id = $1', [id]);
+  const bankChanged = data.bank_id !== undefined && prev !== null && (data.bank_id ?? null) !== (prev.bank_id ?? null);
+  const yieldTurnedOn = data.earns_yield === true && prev !== null && !prev.earns_yield;
+  if (bankChanged || yieldTurnedOn) {
+    // Cambiar de banco o volver a generar rendimiento: el abono automático empieza hoy (sin días anteriores).
+    params.push(todayISO());
+    sets.push(`yield_accrued_until = GREATEST(COALESCE(yield_accrued_until, DATE '1900-01-01'), (${params.length}::date - 1))`);
+  }
   if (data.kind !== undefined) add('kind', data.kind);
   if (data.opening_balance !== undefined) add('opening_balance', round2(data.opening_balance));
   if (data.opening_date !== undefined) add('opening_date', data.opening_date);
@@ -279,7 +288,7 @@ accountsRouter.get('/:id/movements', async (req, res) => {
       WHERE tr.from_account_id = $1
      UNION ALL
      SELECT CASE WHEN b.source = 'rendimiento' THEN 'yield' ELSE 'adjustment' END, b.id, b.date,
-            CASE WHEN b.source = 'rendimiento' THEN 'Rendimiento' ELSE 'Ajuste de saldo' END || CASE WHEN b.note <> '' THEN ' · ' || b.note ELSE '' END,
+            CASE WHEN b.auto THEN 'Rendimiento del día' WHEN b.source = 'rendimiento' THEN 'Rendimiento' || CASE WHEN b.note <> '' THEN ' · ' || b.note ELSE '' END ELSE 'Ajuste de saldo' || CASE WHEN b.note <> '' THEN ' · ' || b.note ELSE '' END END,
             b.amount, b.created_at
        FROM balance_adjustments b
       WHERE b.account_id = $1`,

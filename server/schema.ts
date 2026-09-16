@@ -118,7 +118,14 @@ CREATE TABLE IF NOT EXISTS banks (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_banks_name_ci ON banks (lower(name));
 
+-- Rendimiento automático diario (server/yieldAccrual.ts)
+ALTER TABLE banks ADD COLUMN IF NOT EXISTS auto_yield BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE banks ADD COLUMN IF NOT EXISTS rate_since DATE;
+UPDATE banks SET rate_since = (created_at AT TIME ZONE 'America/Mexico_City')::date WHERE rate_since IS NULL;
+
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS bank_id INT REFERENCES banks(id) ON DELETE SET NULL;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS yield_accrued_until DATE;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS yield_carry NUMERIC(14,6) NOT NULL DEFAULT 0;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS earns_yield BOOLEAN NOT NULL DEFAULT true;
 CREATE INDEX IF NOT EXISTS idx_accounts_bank ON accounts(bank_id);
 
@@ -174,6 +181,19 @@ DO $$ BEGIN
     ALTER TABLE balance_adjustments ADD CONSTRAINT balance_adjustments_source_chk CHECK (source IN ('ajuste', 'rendimiento'));
   END IF;
 END $$;
+-- auto = abono diario automático de rendimiento (uno por cuenta y día)
+ALTER TABLE balance_adjustments ADD COLUMN IF NOT EXISTS auto BOOLEAN NOT NULL DEFAULT false;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_adjustments_auto_yield ON balance_adjustments(account_id, date) WHERE auto;
+
+-- Tokens para registrar desde fuera de la web (Atajos de iPhone). Solo se guarda el hash.
+CREATE TABLE IF NOT EXISTS api_tokens (
+  id            SERIAL PRIMARY KEY,
+  name          TEXT NOT NULL,
+  token_hash    TEXT NOT NULL UNIQUE,
+  prefix        TEXT NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_used_at  TIMESTAMPTZ
+);
 
 -- Cargos recurrentes (suscripciones, pagos e ingresos fijos) que se registran solos
 CREATE TABLE IF NOT EXISTS recurring_charges (

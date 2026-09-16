@@ -6,7 +6,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { one, withTransaction } from '../db.js';
 import { loadBanks } from '../accountsData.js';
-import { HttpError, notFound, parseId, round2, validate, zColor, zMoneyNonNeg, zName } from '../util.js';
+import { HttpError, notFound, parseId, round2, todayISO, validate, zColor, zMoneyNonNeg, zName } from '../util.js';
 import type { Bank } from '../../shared/types.js';
 
 export const banksRouter = Router();
@@ -19,6 +19,7 @@ const bankSchema = z.object({
   annual_rate: zRate,
   yield_cap: zMoneyNonNeg.nullable().optional(),
   rate_above_cap: zRate.optional(),
+  auto_yield: z.boolean().optional(),
 });
 
 const DUPLICATE = 'Ya existe un banco con ese nombre';
@@ -52,14 +53,16 @@ banksRouter.post('/', async (req, res) => {
   const data = validate(bankSchema, req.body);
   await assertUniqueName(data.name, null);
   const row = await one<{ id: number }>(
-    `INSERT INTO banks (name, color, annual_rate, yield_cap, rate_above_cap)
-     VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+    `INSERT INTO banks (name, color, annual_rate, yield_cap, rate_above_cap, auto_yield, rate_since)
+     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
     [
       data.name,
       data.color ?? '#e5202e',
       round3(data.annual_rate),
       data.yield_cap === undefined || data.yield_cap === null ? null : round2(data.yield_cap),
       round3(data.rate_above_cap ?? 0),
+      data.auto_yield ?? true,
+      todayISO(), // el abono diario automático empieza hoy (no se abonan días anteriores)
     ],
   ).catch(mapDuplicate);
   res.status(201).json(await loadBank(row!.id));
@@ -68,7 +71,10 @@ banksRouter.post('/', async (req, res) => {
 banksRouter.put('/:id', async (req, res) => {
   const id = parseId(req.params.id);
   const data = validate(bankSchema.partial(), req.body);
-  const current = await one<{ name: string }>('SELECT name FROM banks WHERE id = $1', [id]);
+  const current = await one<{ name: string; annual_rate: number; rate_above_cap: number; auto_yield: boolean }>(
+    'SELECT name, annual_rate, rate_above_cap, auto_yield FROM banks WHERE id = $1',
+    [id],
+  );
   if (!current) throw notFound('Banco');
   if (data.name !== undefined && data.name.toLocaleLowerCase('es') !== current.name.toLocaleLowerCase('es')) {
     await assertUniqueName(data.name, id);
@@ -85,6 +91,13 @@ banksRouter.put('/:id', async (req, res) => {
   if (data.annual_rate !== undefined) add('annual_rate', round3(data.annual_rate));
   if (data.yield_cap !== undefined) add('yield_cap', data.yield_cap === null ? null : round2(data.yield_cap));
   if (data.rate_above_cap !== undefined) add('rate_above_cap', round3(data.rate_above_cap));
+  if (data.auto_yield !== undefined) add('auto_yield', data.auto_yield);
+  // Si antes no generaba abono automático (tasa 0 o auto_yield apagado) y ahora sí, empieza a contar desde hoy.
+  const wasEarning = current.auto_yield && (Number(current.annual_rate) > 0 || Number(current.rate_above_cap) > 0);
+  const nextRate = data.annual_rate ?? Number(current.annual_rate);
+  const nextAbove = data.rate_above_cap ?? Number(current.rate_above_cap);
+  const nextAuto = data.auto_yield ?? current.auto_yield;
+  if (!wasEarning && nextAuto && (nextRate > 0 || nextAbove > 0)) add('rate_since', todayISO());
 
   if (sets.length > 0) {
     params.push(id);
