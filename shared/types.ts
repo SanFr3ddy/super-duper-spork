@@ -501,6 +501,10 @@ export interface DashboardYear {
 //    Empieza en max(opening_date de la cuenta, banks.rate_since, yield_accrued_until + 1). rate_since = hoy cuando
 //    un banco pasa de tasa 0 a > 0 o se activa auto_yield; cambiar el banco de una cuenta o activar earns_yield
 //    empieza a contar desde hoy. Se ejecuta al arrancar, cada hora y como máximo cada 5 min con peticiones.
+//    FIN DE SEMANA (banks.weekend_on_monday = true, p. ej. DiDi): el rendimiento del sábado y del domingo se genera
+//    igual pero NO se abona esos días (se acumula en yield_carry y no se capitaliza); se abona el lunes en el abono
+//    automático de ese lunes (aparece desde el lunes, nota "Rendimiento del sábado y domingo") y al cerrar el lunes se
+//    le suma lo del lunes (nota "Rendimiento de sábado a lunes"). Sigue habiendo un solo abono por cuenta y día.
 //  - Sugerencias: el dinero por encima del tope de un banco (que rinde rate_above_cap) se sugiere mover a bancos con
 //    mayor tasa y espacio bajo su tope (o sin tope), en orden de tasa desc; solo si gana >= $1 al año.
 // ---------------------------------------------------------------------------
@@ -513,6 +517,7 @@ export interface Bank {
   rate_above_cap: number; // % anual para lo que exceda el tope (normalmente 0)
   auto_yield: boolean; // abonar el rendimiento automáticamente cada día
   rate_since: string | null; // día desde el que se abona automáticamente
+  weekend_on_monday: boolean; // sábado y domingo se abonan el lunes (no abona en fin de semana)
   created_at: string;
   // calculados (a hoy, cuentas no archivadas)
   accounts_count: number;
@@ -531,6 +536,7 @@ export interface BankInput {
   name: string;
   color?: string;
   auto_yield?: boolean; // por defecto true
+  weekend_on_monday?: boolean; // por defecto false
   annual_rate: number; // 0..1000
   yield_cap?: number | null;
   rate_above_cap?: number;
@@ -627,6 +633,7 @@ export interface AccountMovement {
   amount: number; // con signo: + entra, - sale
   running_balance: number; // saldo después de este movimiento
   future: boolean; // fecha posterior a hoy (no cuenta en el saldo actual)
+  auto?: boolean; // true = abono automático de rendimiento (server/yieldAccrual.ts)
 }
 
 export interface Transfer {

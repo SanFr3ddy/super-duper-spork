@@ -16,6 +16,7 @@ import * as budgets from './views/budgets';
 import * as categories from './views/categories';
 import * as accounts from './views/accounts';
 import * as recurring from './views/recurring';
+import * as iphone from './views/iphone';
 
 interface View {
   render: (root: HTMLElement) => Promise<void> | void;
@@ -42,6 +43,7 @@ export const ROUTES: Route[] = [
   { path: 'ahorros', title: 'Metas', subtitle: 'Metas de ahorro y aportes', icon: '🎯', view: goals, nav: true },
   { path: 'presupuestos', title: 'Presupuestos', subtitle: 'Límites mensuales por categoría', icon: '📐', view: budgets, nav: true, short: 'Presup.' },
   { path: 'categorias', title: 'Categorías', subtitle: 'Personaliza tus categorías', icon: '🏷️', view: categories, nav: false },
+  { path: 'iphone', title: 'iPhone y Atajos', subtitle: 'Registra gastos sin abrir la web', icon: '📱', view: iphone, nav: false },
 ];
 
 const app = document.getElementById('app')!;
@@ -59,6 +61,16 @@ export function navigate(path: string): void {
 
 function renderLayout(): void {
   app.innerHTML = `
+    <style>
+      /* Enlaces superiores en móvil (Categorías, iPhone, Salir): compactos para caber en 390px sin romper línea. */
+      @media (max-width: 480px) {
+        .mobile-links .row { gap: 2px; }
+        .mobile-links .btn.sm { padding: 6px 8px; }
+      }
+      @media (max-width: 400px) {
+        .mobile-links .mobile-brand-name { display: none; }
+      }
+    </style>
     <div class="app">
       <aside class="sidebar">
         <div class="brand">
@@ -72,14 +84,16 @@ function renderLayout(): void {
         </nav>
         <div class="sidebar-foot">
           <a href="#/categorias" class="btn ghost sm" data-route="categorias">🏷️ Categorías</a>
+          <a href="#/iphone" class="btn ghost sm" data-route="iphone">📱 iPhone</a>
           ${authState.required ? '<button type="button" class="btn ghost sm" data-logout>Cerrar sesión</button>' : ''}
         </div>
       </aside>
       <main class="main">
         <div class="mobile-links">
-          <span class="mobile-brand"><span class="brand-logo">F</span>Finanzas</span>
+          <span class="mobile-brand"><span class="brand-logo">F</span><span class="mobile-brand-name">Finanzas</span></span>
           <span class="row">
             <a href="#/categorias" class="btn ghost sm" data-route="categorias">🏷️ Categorías</a>
+            <a href="#/iphone" class="btn ghost sm" data-route="iphone">📱 iPhone</a>
             ${authState.required ? '<button type="button" class="btn ghost sm" data-logout>Salir</button>' : ''}
           </span>
         </div>

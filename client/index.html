@@ -2,10 +2,17 @@
 <html lang="es">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="color-scheme" content="dark" />
     <meta name="theme-color" content="#0b0b0b" />
     <title>Finanzas · Hábitos</title>
+    <!-- App instalable (Safari → Compartir → Agregar a pantalla de inicio; Chrome → Instalar app) -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Finanzas" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230b0b0b'/%3E%3Cpath d='M18 44V20h10.5c6 0 9.5 3 9.5 7.6 0 3.2-1.8 5.4-4.6 6.4L41 44h-7.4l-6.6-9H24.6v9H18zm6.6-14h3.6c2.6 0 4.2-1 4.2-3.1s-1.6-3-4.2-3h-3.6v6.1z' fill='%23e5202e'/%3E%3C/svg%3E" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -14,6 +21,38 @@
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/src/styles.css" />
+    <style>
+      /* Pantalla completa en iPhone (status bar black-translucent + viewport-fit=cover): el contenido no queda
+         debajo de la hora/notch ni del indicador de inicio. En Safari normal los márgenes seguros valen 0.
+         Selectores más específicos que los de styles.css porque Vite puede insertar esa hoja después. */
+      html body {
+        padding-top: env(safe-area-inset-top, 0px);
+        padding-left: env(safe-area-inset-left, 0px);
+        padding-right: env(safe-area-inset-right, 0px);
+      }
+      #modal-root .modal-backdrop {
+        padding-top: max(16px, env(safe-area-inset-top, 0px));
+        padding-bottom: max(16px, env(safe-area-inset-bottom, 0px));
+      }
+      #modal-root .modal {
+        max-height: calc(100vh - max(16px, env(safe-area-inset-top, 0px)) - max(16px, env(safe-area-inset-bottom, 0px)));
+      }
+      /* Barra inferior en móvil: styles.css ya le suma el indicador de inicio al padding, pero con altura fija
+         (--nav-h) eso aplastaba los íconos al activar viewport-fit=cover. Se crece la barra en lo que ocupa el indicador. */
+      @media (max-width: 820px) {
+        html body .sidebar {
+          height: calc(var(--nav-h) + max(0px, env(safe-area-inset-bottom, 0px) - 6px));
+          padding-left: max(8px, env(safe-area-inset-left, 0px));
+          padding-right: max(8px, env(safe-area-inset-right, 0px));
+        }
+        html body .main {
+          padding-bottom: calc(var(--nav-h) + 28px + env(safe-area-inset-bottom, 0px));
+        }
+        html body #toast-root {
+          bottom: calc(var(--nav-h) + 12px + env(safe-area-inset-bottom, 0px));
+        }
+      }
+    </style>
   </head>
   <body>
     <div id="app">

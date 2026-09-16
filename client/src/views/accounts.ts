@@ -1,7 +1,9 @@
 /**
  * Vista "Mi dinero": dinero real por cuenta y por banco, con transferencias, ajustes de saldo,
- * Mis bancos (rendimiento anual con tope) y registro de rendimientos.
- * Contrato: secciones "Mi dinero" y "Mis bancos" de shared/types.ts.
+ * Mis bancos (rendimiento anual con tope), abono diario automático de rendimientos y registro manual de rendimientos.
+ * Contrato: secciones "Mi dinero", "Mis bancos" y "RENDIMIENTOS" (ABONO DIARIO AUTOMÁTICO) de shared/types.ts.
+ * El abono diario lo hace el servidor (server/yieldAccrual.ts); aquí solo se muestra (last_auto_yield) y, en bancos
+ * con abono automático, se oculta "Registrar rendimiento" para no duplicar.
  * API: /api/accounts (server/routes/accounts.ts) y /api/banks (server/routes/banks.ts).
  * Los saldos y rendimientos los calcula SIEMPRE el servidor (server/accountsData.ts, server/yields.ts);
  * aquí solo se muestran. La única cuenta local es la vista previa del formulario de banco.
@@ -24,7 +26,7 @@ import type {
   YieldSuggestion,
 } from '../../../shared/types';
 import { api, qs, ApiError } from '../api';
-import { esc, money, moneySigned, pct, fmtDate, monthName, todayISO, currentYear, settings } from '../format';
+import { esc, money, moneySigned, pct, fmtDate, fmtDateShort, monthName, todayISO, currentYear, settings } from '../format';
 import { formModal, openModal, confirmDialog, toast, showError, field, input, moneyInput, select, emptyState, loadingState, on, toNumber, progressBar } from '../ui';
 import { monthlyBars, horizontalBars, legendHtml, COLORS, destroyChart } from '../charts';
 
@@ -86,6 +88,13 @@ const SOURCE_LINKS: Partial<Record<AccountMovementSource, string>> = {
 const DELETE_ACCOUNT_MSG =
   'Se eliminará la cuenta. Los movimientos y pagos se conservarán sin cuenta; sus transferencias y ajustes se borrarán y el saldo de las otras cuentas puede cambiar. Si solo ya no la usas, mejor archívala.';
 const TRANSFER_DISABLED_MSG = 'Necesitas al menos 2 cuentas activas para transferir';
+/** Descripción que el servidor da a los abonos automáticos en los movimientos (server/routes/accounts.ts). */
+const AUTO_YIELD_DESC = 'Rendimiento del día';
+const AUTO_YIELD_HELP =
+  'Cada día se agrega a tus cuentas lo que generaron el día anterior (interés compuesto, respetando el tope), a partir del día en que lo activas. Si tu banco retiene impuestos o paga distinto, cuadra con Ajustar saldo.';
+const WEEKEND_HELP =
+  'Márcalo si tu banco (p. ej. DiDi) no abona el rendimiento en fin de semana: lo generado el sábado y el domingo se suma el lunes.';
+const DELETE_AUTO_YIELD_MSG = 'Este abono automático no se volverá a crear. Si lo borras, ese día queda sin rendimiento.';
 
 let viewRoot: HTMLElement | null = null;
 let data: AccountsOverview | null = null;
@@ -161,6 +170,10 @@ const STYLE = `<style>
 .v-money .v-money-yield-box .card-head { margin-bottom: 10px; }
 .v-money-preview { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 14px; font-size: .9rem; color: var(--text-2); min-height: 1.4em; overflow-wrap: anywhere; }
 .v-money-field-check { display: flex; flex-direction: column; gap: 4px; }
+.v-money .v-money-bk-terms .badge { margin-left: 4px; vertical-align: 1px; white-space: nowrap; }
+.v-money .v-money-bk-warn { font-size: .85rem; overflow-wrap: anywhere; }
+.v-money .v-money-acc-auto { color: var(--muted); }
+.v-money-cap-warn { margin: 0; font-size: .85rem; overflow-wrap: anywhere; }
 </style>`;
 
 // ---------------------------------------------------------------------------
@@ -336,6 +349,54 @@ function bankTermsText(b: BankTermsLike): string {
 }
 
 /**
+ * Algún peso del saldo puede rendir: tasa anual > 0 con tope > 0 (o sin tope), o tasa por encima del tope > 0.
+ * Con tope en $0 y 0% por encima, server/yieldAccrual.ts procesa el banco pero cada abono es $0.
+ */
+function bankYieldsSomething(b: BankTermsLike): boolean {
+  const capAllows = b.yield_cap === null || b.yield_cap >= 0.005;
+  return (b.annual_rate > 0 && capAllows) || (b.yield_cap !== null && b.rate_above_cap > 0);
+}
+
+/** El servidor abona su rendimiento cada día (auto_yield y algo que rinda; ver server/yieldAccrual.ts). */
+function bankAutoYields(b: BankTermsLike & Pick<Bank, 'auto_yield'>): boolean {
+  return !!b.auto_yield && bankYieldsSomething(b);
+}
+
+/**
+ * Tope en $0 con tasa > 0: nada rinde a la tasa anual (casi siempre es un error de captura). null si no aplica.
+ * `inList`: en la lista de bancos no está la casilla a la vista, así que se indica que hay que editar el banco.
+ */
+function zeroCapWarning(rate: number, cap: number | null, inList = false): string | null {
+  if (cap === null || Math.abs(cap) >= 0.005 || !(rate > 0)) return null;
+  const fix = inList ? "edita el banco y desmarca 'Tiene tope'" : "desmarca 'Tiene tope'";
+  return `Con tope en ${moneyRound(0)} nada rinde al ${rateText(rate)}. Si no hay tope, ${fix}.`;
+}
+
+/** Fecha ISO local desplazada n días (sin desfase de zona horaria). */
+function shiftISO(iso: string, days: number): string {
+  const [y, m, d] = iso.slice(0, 10).split('-').map(Number);
+  const dt = new Date(y, m - 1, d + days);
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+}
+
+/** "ayer", "hoy" o fecha corta ("14 sep"). */
+function dayLabel(iso: string): string {
+  const today = todayISO();
+  if (iso === today) return 'hoy';
+  if (iso === shiftISO(today, -1)) return 'ayer';
+  return fmtDateShort(iso);
+}
+
+/** Abonos automáticos del día más reciente sumados entre las cuentas dadas (null si ninguna tiene). */
+function latestAutoYield(accounts: Account[]): { date: string; amount: number } | null {
+  let date = '';
+  for (const a of accounts) if (a.last_auto_yield && a.last_auto_yield.date > date) date = a.last_auto_yield.date;
+  if (!date) return null;
+  const amount = accounts.reduce((acc, a) => acc + (a.last_auto_yield?.date === date ? Number(a.last_auto_yield.amount) || 0 : 0), 0);
+  return { date, amount: round2(amount) };
+}
+
+/**
  * Solo para la vista previa del formulario de banco (el cálculo real vive en server/yields.ts):
  * (min(saldo, tope) * tasa + excedente * tasa_excedente) / 100 / 12.
  */
@@ -444,7 +505,12 @@ function statTile(label: string, value: string, cls: string, foot: string): stri
 function statsHtml(d: AccountsOverview): string {
   const t = d.totals;
   const y = d.yields;
-  const yieldFoot = y.est_year > 0 ? `${money(y.est_year)} al año · ${rateText(y.effective_rate)} promedio` : 'Configura la tasa de tus bancos';
+  const lastAuto = latestAutoYield(d.items.filter((a) => !a.archived));
+  const footParts: string[] = [];
+  if (y.est_year > 0) footParts.push(`${money(y.est_year)} al año · ${rateText(y.effective_rate)} promedio`);
+  else if (!lastAuto) footParts.push('Configura la tasa de tus bancos');
+  if (lastAuto) footParts.push(`${dayLabel(lastAuto.date)} ${moneySigned(lastAuto.amount)}`);
+  const yieldFoot = footParts.join(' · ');
   return `<div class="grid grid-4">
     ${statTile('Dinero total', money(t.total), t.total < 0 ? 'red' : 'white', `${plural(t.accounts, 'cuenta', 'cuentas')} en ${plural(d.by_bank.length, 'banco', 'bancos')}`)}
     ${statTile('Disponible', money(t.disponible), t.disponible < 0 ? 'red' : 'white', 'Débito, nómina y efectivo')}
@@ -524,18 +590,28 @@ function bankRowHtml(b: Bank): string {
   const info: string[] = [];
   if (earns) info.push(`Rinde ~<span class="white num">${esc(money(b.est_yield_month))}</span>/mes`);
   if (earns || b.yield_registered_year > 0) info.push(`Registrado este año: <span class="white num">${esc(money(b.yield_registered_year))}</span>`);
+  if (b.last_auto_yield) {
+    info.push(
+      `Último abono: <span class="white num">${esc(moneySigned(b.last_auto_yield.amount))}</span> (${esc(fmtDateShort(b.last_auto_yield.date))})`,
+    );
+  }
+  const autoBadge = bankAutoYields(b)
+    ? ` <span class="badge white">Se suma cada día</span>${b.weekend_on_monday ? ' <span class="badge gray">Fin de semana: el lunes</span>' : ''}`
+    : '';
+  const warning = zeroCapWarning(b.annual_rate, b.yield_cap, true);
   return `<div class="v-money-bk">
     <div class="v-money-bk-top">
       <span class="dot" style="background:${esc(color)}"></span>
       <div class="grow">
         <div class="name" title="${esc(b.name)}">${esc(b.name)}</div>
-        <div class="v-money-bk-terms">${esc(bankTermsText(b))}</div>
+        <div class="v-money-bk-terms">${esc(bankTermsText(b))}${autoBadge}</div>
       </div>
       <div class="v-money-bk-bal">
         <div class="total num ${b.balance < 0 ? 'red' : 'white'}">${esc(money(b.balance))}</div>
         <div class="muted tiny">${esc(accountsText)}</div>
       </div>
     </div>
+    ${warning ? `<div class="red v-money-bk-warn" role="note">${esc(warning)}</div>` : ''}
     ${capHtml}
     <div class="v-money-bk-foot">
       <span>${info.join(' · ')}</span>
@@ -587,7 +663,11 @@ function paintRegistered(): void {
     ${
       any
         ? `<div class="chart-box sm"><canvas data-chart="yield-monthly" role="img" aria-label="Rendimientos registrados por mes en ${esc(d.year)}"></canvas></div>`
-        : `<div class="v-money-empty-sm">${emptyState('🪙', `Sin rendimientos registrados en ${d.year}`, "Registra lo que te paga tu banco con 'Registrar rendimiento'")}</div>`
+        : `<div class="v-money-empty-sm">${emptyState(
+            '🪙',
+            `Sin rendimientos registrados en ${d.year}`,
+            "Los bancos con abono diario los suman solos; en los demás registra lo que te paga tu banco con 'Registrar rendimiento'",
+          )}</div>`
     }`;
 
   const canvas = box.querySelector<HTMLCanvasElement>('[data-chart="yield-monthly"]');
@@ -714,12 +794,23 @@ function accountCardHtml(a: Account, canTransfer: boolean): string {
   const color = HEX_RE.test(a.color) ? a.color : DEFAULT_COLOR;
   const last = a.last_movement_date ? `Último movimiento: ${fmtDate(a.last_movement_date)}` : 'Sin movimientos';
   const bank = bankById(a.bank_id);
-  const canRegisterYield = !a.archived && !!bank && bank.annual_rate > 0;
+  // Con abono diario el servidor ya suma el rendimiento de esta cuenta: registrarlo a mano lo duplicaría.
+  // (Si la cuenta no cuenta para el rendimiento, no recibe abonos y se conserva el registro manual.)
+  const autoDaily = !a.archived && !!bank && bankAutoYields(bank) && a.earns_yield;
+  const canRegisterYield = !a.archived && !!bank && bank.annual_rate > 0 && !autoDaily;
+  const autoNote = '<span class="v-money-acc-auto">Se suma solo cada día</span>';
   let yieldLine = '';
   if (!a.archived && a.est_yield_month > 0) {
-    yieldLine = `<div class="v-money-acc-yield">Rinde ~<span class="white num">${esc(money(a.est_yield_month))}</span>/mes</div>`;
+    yieldLine = `<div class="v-money-acc-yield">Rinde ~<span class="white num">${esc(money(a.est_yield_month))}</span>/mes${autoDaily ? ` · ${autoNote}` : ''}</div>`;
+  } else if (autoDaily) {
+    yieldLine = `<div class="v-money-acc-yield">${autoNote}</div>`;
   } else if (canRegisterYield && !a.earns_yield) {
     yieldLine = '<div class="v-money-acc-yield muted">No cuenta para el rendimiento de su banco</div>';
+  }
+  if (a.last_auto_yield) {
+    yieldLine += `<div class="v-money-acc-yield"><span class="white">Rendimiento ${esc(fmtDateShort(a.last_auto_yield.date))}: <span class="num">${esc(
+      moneySigned(a.last_auto_yield.amount),
+    )}</span></span></div>`;
   }
   const actions = a.archived
     ? `<button type="button" class="btn sm" data-restore="${a.id}">Restaurar</button>
@@ -1059,6 +1150,8 @@ function openSuggestedTransfer(s: YieldSuggestion): void {
 function openBankForm(bank?: Bank, onSaved?: (saved: Bank) => void): void {
   const color = bank && HEX_RE.test(bank.color) ? bank.color : DEFAULT_COLOR;
   const hasCap = bank ? bank.yield_cap !== null : false;
+  const autoYield = bank ? bank.auto_yield : true;
+  const weekendOnMonday = bank ? !!bank.weekend_on_monday : false;
   const taken = new Set((data?.banks ?? []).filter((b) => b.id !== bank?.id).map((b) => bankKey(b.name)));
   const names = BANK_SUGGESTIONS.filter((n) => !taken.has(bankKey(n)));
   // Saldo que rinde hoy en el banco; sin cuentas (o en 0) se usa un ejemplo.
@@ -1095,14 +1188,36 @@ function openBankForm(bank?: Bank, onSaved?: (saved: Bank) => void): void {
           'Lo que rinde el dinero que pasa del tope (normalmente 0)',
         )}
       </div>
+      <p class="red v-money-cap-warn hidden" data-cap-warn aria-live="polite"></p>
+      <div class="v-money-field-check">
+        <label class="v-money-check"><input type="checkbox" name="auto_yield" ${autoYield ? 'checked' : ''} /> Sumar el rendimiento automáticamente cada día</label>
+        <span class="help">${esc(AUTO_YIELD_HELP)}</span>
+      </div>
+      <div class="v-money-field-check">
+        <label class="v-money-check"><input type="checkbox" name="weekend_on_monday" ${weekendOnMonday ? 'checked' : ''} /> Sábado y domingo se abonan el lunes</label>
+        <span class="help">${esc(WEEKEND_HELP)}</span>
+      </div>
       <p class="v-money-preview" data-preview aria-live="polite"></p>
     </form>`,
     onOpen: (form) => {
       const capToggle = form.querySelector<HTMLInputElement>('[data-has-cap]');
       const capBox = form.querySelector<HTMLElement>('[data-cap-fields]');
       const out = form.querySelector<HTMLElement>('[data-preview]');
+      const warnEl = form.querySelector<HTMLElement>('[data-cap-warn]');
       const val = (name: string): string => form.querySelector<HTMLInputElement>(`input[name="${name}"]`)?.value.trim() ?? '';
+      // Advertencia suave (no bloquea el envío): tope en $0 con tasa > 0.
+      const warnCap = (): void => {
+        if (!warnEl) return;
+        const rate = Number(val('annual_rate'));
+        const rawCap = val('yield_cap');
+        const capNum = Number(rawCap);
+        const msg =
+          capToggle?.checked && rawCap !== '' && Number.isFinite(capNum) && Number.isFinite(rate) ? zeroCapWarning(rate, capNum) : null;
+        warnEl.textContent = msg ?? '';
+        warnEl.classList.toggle('hidden', !msg);
+      };
       const preview = (): void => {
+        warnCap();
         if (!out) return;
         const rawRate = val('annual_rate');
         const rate = Number(rawRate);
@@ -1158,6 +1273,8 @@ function openBankForm(bank?: Bank, onSaved?: (saved: Bank) => void): void {
         annual_rate: rate,
         yield_cap: cap === null ? null : round2(cap),
         rate_above_cap: above,
+        auto_yield: v.auto_yield === 'on',
+        weekend_on_monday: v.weekend_on_monday === 'on',
       };
       const saved = bank ? await api.put<Bank>(`/api/banks/${bank.id}`, body) : await api.post<Bank>('/api/banks', body);
       modal.close();
@@ -1227,8 +1344,11 @@ function movementRowHtml(m: AccountMovement): string {
   const desc = m.description && m.description !== label ? `<div class="v-money-mv-desc">${esc(m.description)}</div>` : '';
   let action = '';
   if (m.ref_id !== null && (m.source === 'adjustment' || m.source === 'yield')) {
-    const what = m.source === 'yield' ? 'rendimiento' : 'ajuste';
-    action = `<button type="button" class="btn ghost sm icon" data-del-adjust="${m.ref_id}" data-adjust-kind="${m.source}" aria-label="Eliminar ${what}" title="Eliminar ${what}">🗑</button>`;
+    // Abono diario automático: se borra igual que un ajuste, pero el confirm advierte que no se vuelve a crear.
+    const isAuto = m.source === 'yield' && (m.auto === true || m.description === AUTO_YIELD_DESC);
+    const kind = isAuto ? 'auto' : m.source;
+    const what = isAuto ? 'abono automático' : m.source === 'yield' ? 'rendimiento' : 'ajuste';
+    action = `<button type="button" class="btn ghost sm icon" data-del-adjust="${m.ref_id}" data-adjust-kind="${esc(kind)}" aria-label="Eliminar ${esc(what)}" title="Eliminar ${esc(what)}">🗑</button>`;
   } else if (m.ref_id !== null && (m.source === 'transfer_in' || m.source === 'transfer_out')) {
     action = `<button type="button" class="btn ghost sm icon" data-del-transfer="${m.ref_id}" aria-label="Eliminar transferencia" title="Eliminar transferencia">🗑</button>`;
   } else if (SOURCE_LINKS[m.source]) {
@@ -1296,14 +1416,20 @@ async function openMovements(acc: Account): Promise<void> {
   on(modal.body, 'click', '[data-del-adjust]', async (el) => {
     const id = el.dataset.delAdjust;
     if (!id) return;
-    const isYield = el.dataset.adjustKind === 'yield';
-    const ok = isYield
-      ? await confirmDialog('Se eliminará este rendimiento registrado y el saldo de la cuenta cambiará.', { title: 'Eliminar rendimiento', okLabel: 'Eliminar rendimiento' })
-      : await confirmDialog('Se eliminará este ajuste de saldo y el saldo de la cuenta cambiará.', { title: 'Eliminar ajuste', okLabel: 'Eliminar ajuste' });
+    const kind = el.dataset.adjustKind;
+    const isYield = kind === 'yield' || kind === 'auto';
+    let ok: boolean;
+    if (kind === 'auto') {
+      ok = await confirmDialog(`${DELETE_AUTO_YIELD_MSG} El saldo de la cuenta cambiará.`, { title: 'Eliminar abono automático', okLabel: 'Eliminar abono' });
+    } else if (isYield) {
+      ok = await confirmDialog('Se eliminará este rendimiento registrado y el saldo de la cuenta cambiará.', { title: 'Eliminar rendimiento', okLabel: 'Eliminar rendimiento' });
+    } else {
+      ok = await confirmDialog('Se eliminará este ajuste de saldo y el saldo de la cuenta cambiará.', { title: 'Eliminar ajuste', okLabel: 'Eliminar ajuste' });
+    }
     if (!ok) return;
     try {
       await api.del(`/api/accounts/${acc.id}/adjustments/${id}`);
-      await afterDelete(isYield ? 'Rendimiento eliminado' : 'Ajuste eliminado');
+      await afterDelete(kind === 'auto' ? 'Abono eliminado' : isYield ? 'Rendimiento eliminado' : 'Ajuste eliminado');
     } catch (err) {
       showError(err);
     }

@@ -20,6 +20,7 @@ const bankSchema = z.object({
   yield_cap: zMoneyNonNeg.nullable().optional(),
   rate_above_cap: zRate.optional(),
   auto_yield: z.boolean().optional(),
+  weekend_on_monday: z.boolean().optional(),
 });
 
 const DUPLICATE = 'Ya existe un banco con ese nombre';
@@ -53,8 +54,8 @@ banksRouter.post('/', async (req, res) => {
   const data = validate(bankSchema, req.body);
   await assertUniqueName(data.name, null);
   const row = await one<{ id: number }>(
-    `INSERT INTO banks (name, color, annual_rate, yield_cap, rate_above_cap, auto_yield, rate_since)
-     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+    `INSERT INTO banks (name, color, annual_rate, yield_cap, rate_above_cap, auto_yield, rate_since, weekend_on_monday)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
     [
       data.name,
       data.color ?? '#e5202e',
@@ -63,6 +64,7 @@ banksRouter.post('/', async (req, res) => {
       round3(data.rate_above_cap ?? 0),
       data.auto_yield ?? true,
       todayISO(), // el abono diario automático empieza hoy (no se abonan días anteriores)
+      data.weekend_on_monday ?? false,
     ],
   ).catch(mapDuplicate);
   res.status(201).json(await loadBank(row!.id));
@@ -92,6 +94,7 @@ banksRouter.put('/:id', async (req, res) => {
   if (data.yield_cap !== undefined) add('yield_cap', data.yield_cap === null ? null : round2(data.yield_cap));
   if (data.rate_above_cap !== undefined) add('rate_above_cap', round3(data.rate_above_cap));
   if (data.auto_yield !== undefined) add('auto_yield', data.auto_yield);
+  if (data.weekend_on_monday !== undefined) add('weekend_on_monday', data.weekend_on_monday);
   // Si antes no generaba abono automático (tasa 0 o auto_yield apagado) y ahora sí, empieza a contar desde hoy.
   const wasEarning = current.auto_yield && (Number(current.annual_rate) > 0 || Number(current.rate_above_cap) > 0);
   const nextRate = data.annual_rate ?? Number(current.annual_rate);

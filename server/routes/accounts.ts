@@ -263,33 +263,33 @@ accountsRouter.get('/:id/movements', async (req, res) => {
   );
   if (!acc) throw notFound('Cuenta');
 
-  type Row = { source: AccountMovementSource; ref_id: number; date: string; description: string; amount: number; created_at: Date | string };
+  type Row = { source: AccountMovementSource; ref_id: number; date: string; description: string; amount: number; created_at: Date | string; auto: boolean };
   const rows = await query<Row>(
     `SELECT CASE WHEN t.type = 'income' THEN 'income' ELSE 'expense' END AS source, t.id AS ref_id, t.date,
             COALESCE(NULLIF(t.description, ''), c.name, CASE WHEN t.type = 'income' THEN 'Ingreso' ELSE 'Gasto' END) AS description,
-            CASE WHEN t.type = 'income' THEN t.amount ELSE -t.amount END AS amount, t.created_at
+            CASE WHEN t.type = 'income' THEN t.amount ELSE -t.amount END AS amount, t.created_at, false AS auto
        FROM transactions t LEFT JOIN categories c ON c.id = t.category_id
       WHERE t.account_id = $1 AND (t.type = 'income' OR t.credit_card_id IS NULL)
      UNION ALL
-     SELECT 'card_payment', p.id, p.date, 'Pago de tarjeta ' || cc.name || CASE WHEN p.note <> '' THEN ' · ' || p.note ELSE '' END, -p.amount, p.created_at
+     SELECT 'card_payment', p.id, p.date, 'Pago de tarjeta ' || cc.name || CASE WHEN p.note <> '' THEN ' · ' || p.note ELSE '' END, -p.amount, p.created_at, false
        FROM card_payments p JOIN credit_cards cc ON cc.id = p.credit_card_id
       WHERE p.account_id = $1
      UNION ALL
-     SELECT 'loan_payment', p.id, p.date, 'Pago de préstamo ' || l.name || CASE WHEN p.note <> '' THEN ' · ' || p.note ELSE '' END, -p.amount, p.created_at
+     SELECT 'loan_payment', p.id, p.date, 'Pago de préstamo ' || l.name || CASE WHEN p.note <> '' THEN ' · ' || p.note ELSE '' END, -p.amount, p.created_at, false
        FROM loan_payments p JOIN loans l ON l.id = p.loan_id
       WHERE p.account_id = $1
      UNION ALL
-     SELECT 'transfer_in', tr.id, tr.date, 'Transferencia desde ' || fa.name || CASE WHEN fa.bank <> '' THEN ' (' || fa.bank || ')' ELSE '' END || CASE WHEN tr.note <> '' THEN ' · ' || tr.note ELSE '' END, tr.amount, tr.created_at
+     SELECT 'transfer_in', tr.id, tr.date, 'Transferencia desde ' || fa.name || CASE WHEN fa.bank <> '' THEN ' (' || fa.bank || ')' ELSE '' END || CASE WHEN tr.note <> '' THEN ' · ' || tr.note ELSE '' END, tr.amount, tr.created_at, false
        FROM transfers tr JOIN accounts fa ON fa.id = tr.from_account_id
       WHERE tr.to_account_id = $1
      UNION ALL
-     SELECT 'transfer_out', tr.id, tr.date, 'Transferencia a ' || ta.name || CASE WHEN ta.bank <> '' THEN ' (' || ta.bank || ')' ELSE '' END || CASE WHEN tr.note <> '' THEN ' · ' || tr.note ELSE '' END, -tr.amount, tr.created_at
+     SELECT 'transfer_out', tr.id, tr.date, 'Transferencia a ' || ta.name || CASE WHEN ta.bank <> '' THEN ' (' || ta.bank || ')' ELSE '' END || CASE WHEN tr.note <> '' THEN ' · ' || tr.note ELSE '' END, -tr.amount, tr.created_at, false
        FROM transfers tr JOIN accounts ta ON ta.id = tr.to_account_id
       WHERE tr.from_account_id = $1
      UNION ALL
      SELECT CASE WHEN b.source = 'rendimiento' THEN 'yield' ELSE 'adjustment' END, b.id, b.date,
-            CASE WHEN b.auto THEN 'Rendimiento del día' WHEN b.source = 'rendimiento' THEN 'Rendimiento' || CASE WHEN b.note <> '' THEN ' · ' || b.note ELSE '' END ELSE 'Ajuste de saldo' || CASE WHEN b.note <> '' THEN ' · ' || b.note ELSE '' END END,
-            b.amount, b.created_at
+            CASE WHEN b.auto THEN COALESCE(NULLIF(b.note, ''), 'Rendimiento del día') WHEN b.source = 'rendimiento' THEN 'Rendimiento' || CASE WHEN b.note <> '' THEN ' · ' || b.note ELSE '' END ELSE 'Ajuste de saldo' || CASE WHEN b.note <> '' THEN ' · ' || b.note ELSE '' END END,
+            b.amount, b.created_at, b.auto
        FROM balance_adjustments b
       WHERE b.account_id = $1`,
     [id],
@@ -328,6 +328,7 @@ accountsRouter.get('/:id/movements', async (req, res) => {
       amount,
       running_balance: balance,
       future: e.date > today,
+      ...(e.auto ? { auto: true } : {}),
     });
   }
   res.json(ledger.reverse());

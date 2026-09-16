@@ -63,12 +63,13 @@ type BankRow = {
   rate_above_cap: number;
   auto_yield: boolean;
   rate_since: string | null;
+  weekend_on_monday: boolean;
   created_at: Date | string;
 };
 
 async function loadBankRows(): Promise<BankRow[]> {
   return query<BankRow>(
-    'SELECT id, name, color, annual_rate, yield_cap, rate_above_cap, auto_yield, rate_since, created_at FROM banks ORDER BY lower(name) ASC, id ASC',
+    'SELECT id, name, color, annual_rate, yield_cap, rate_above_cap, auto_yield, rate_since, weekend_on_monday, created_at FROM banks ORDER BY lower(name) ASC, id ASC',
   );
 }
 
@@ -220,6 +221,7 @@ export async function loadBanks(accounts?: Account[]): Promise<Bank[]> {
       rate_above_cap: t.rate_above_cap,
       auto_yield: !!r.auto_yield,
       rate_since: r.rate_since ?? null,
+      weekend_on_monday: !!r.weekend_on_monday,
       created_at: iso(r.created_at),
       accounts_count: mine.length,
       balance: round2(mine.reduce((acc, a) => acc + a.balance, 0)),

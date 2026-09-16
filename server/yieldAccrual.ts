@@ -6,8 +6,12 @@
  *      rendimiento del día = estimateYield(saldo).anual / 365   (el saldo ya incluye abonos previos: compuesto)
  *    y se reparte entre sus cuentas con saldo > 0 en proporción a su saldo.
  *  - Centavos: se abona el monto truncado a centavos y el resto se guarda en accounts.yield_carry.
- *  - Idempotente: primero se avanza accounts.yield_accrued_until con UPDATE ... WHERE < d (solo un proceso gana)
- *    y el índice único (account_id, date) WHERE auto impide duplicar abonos.
+ *  - Bancos con weekend_on_monday (no abonan en fin de semana): lo generado el sábado y el domingo va completo a
+ *    yield_carry (no se capitaliza) y se abona el lunes: al procesar el domingo se crea el abono con fecha del lunes
+ *    y al procesar el lunes se le suma lo de ese día (un solo abono por cuenta y fecha).
+ *  - Idempotente: cada día se bloquean las cuentas pendientes (SELECT ... FOR UPDATE, en orden de id) y se relee
+ *    su yield_accrued_until y yield_carry; luego se avanza yield_accrued_until con UPDATE ... WHERE < d (solo un
+ *    proceso gana) y el índice único (account_id, date) WHERE auto impide duplicar abonos.
  */
 import { pool, query } from './db.js';
 import { round2, todayISO } from './util.js';
@@ -21,6 +25,27 @@ export function addDaysISO(isoDate: string, days: number): string {
   const dt = new Date(Date.UTC(y, m - 1, d + days));
   return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
 }
+
+/** true si la fecha (YYYY-MM-DD) cae en sábado o domingo. */
+export function isWeekendISO(isoDate: string): boolean {
+  const [y, m, d] = isoDate.slice(0, 10).split('-').map(Number);
+  const wd = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+  return wd === 0 || wd === 6;
+}
+
+/**
+ * Fecha del abono de lo generado el día d, o null si se acumula para un abono posterior.
+ * Sin weekend_on_monday: el mismo d. Con weekend_on_monday: entre semana d; sábado => null; domingo => el lunes.
+ */
+export function payoutDate(d: string, weekendOnMonday: boolean): string | null {
+  if (!weekendOnMonday || !isWeekendISO(d)) return d;
+  const next = addDaysISO(d, 1);
+  return isWeekendISO(next) ? null : next;
+}
+
+export const AUTO_YIELD_NOTE = 'Rendimiento del día';
+export const AUTO_YIELD_NOTE_WEEKEND = 'Rendimiento del sábado y domingo';
+export const AUTO_YIELD_NOTE_WEEKEND_MONDAY = 'Rendimiento de sábado a lunes';
 
 /** Rendimiento de UN día (sin redondear) para el saldo que rinde de un banco. */
 export function dailyYieldRaw(yieldBalance: number, terms: Pick<BankTerms, 'annual_rate' | 'yield_cap' | 'rate_above_cap'>): number {
@@ -65,6 +90,7 @@ type CandidateRow = {
   annual_rate: number;
   yield_cap: number | null;
   rate_above_cap: number;
+  weekend_on_monday: boolean;
 };
 
 /**
@@ -75,11 +101,12 @@ export async function accrueDailyYields(today = todayISO(), onlyAccountIds?: num
   const yesterday = addDaysISO(today, -1);
   const candidates = await query<CandidateRow>(
     `SELECT a.id, a.bank_id, a.opening_date, a.yield_accrued_until, a.yield_carry,
-            b.rate_since, b.annual_rate, b.yield_cap, b.rate_above_cap
+            b.rate_since, b.annual_rate, b.yield_cap, b.rate_above_cap, b.weekend_on_monday
        FROM accounts a
        JOIN banks b ON b.id = a.bank_id
       WHERE NOT a.archived AND a.earns_yield AND b.auto_yield AND (b.annual_rate > 0 OR b.rate_above_cap > 0)
-        AND ($1::int[] IS NULL OR a.id = ANY($1::int[]))`,
+        AND ($1::int[] IS NULL OR a.id = ANY($1::int[]))
+      ORDER BY a.id`,
     [onlyAccountIds ?? null],
   );
   if (candidates.length === 0) return 0;
@@ -115,9 +142,25 @@ export async function accrueDailyYields(today = todayISO(), onlyAccountIds?: num
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      // Bloquea las cuentas pendientes (en orden de id: sin interbloqueos entre procesos) y relee su estado.
+      // Si otro proceso ya procesó este día (o borraron la cuenta) se omite; el carry sale de la base porque el
+      // leído al inicio puede estar desactualizado (p. ej. otro proceso abonó días anteriores y dejó en yield_carry
+      // lo del sábado): usar el viejo perdería o duplicaría centavos, o todo el rendimiento del fin de semana.
+      const locked = await client.query<{ id: number; yield_accrued_until: string | null; yield_carry: number }>(
+        'SELECT id, yield_accrued_until, yield_carry FROM accounts WHERE id = ANY($1::int[]) ORDER BY id FOR UPDATE',
+        [[...dueIds]],
+      );
+      const pending = new Set<number>();
+      for (const r of locked.rows) {
+        if (r.yield_accrued_until && r.yield_accrued_until >= d) continue;
+        pending.add(r.id);
+        carries.set(r.id, Number(r.yield_carry) || 0);
+      }
+      for (const id of [...dueIds]) if (!pending.has(id)) dueIds.delete(id);
       for (const [, list] of byBank) {
         if (!list.some((c) => dueIds.has(c.id))) continue;
         const t = list[0];
+        const payDate = payoutDate(d, !!t.weekend_on_monday);
         const terms = {
           annual_rate: Number(t.annual_rate) || 0,
           yield_cap: t.yield_cap === null ? null : Number(t.yield_cap),
@@ -130,23 +173,31 @@ export async function accrueDailyYields(today = todayISO(), onlyAccountIds?: num
         );
         for (const sh of shares) {
           if (!dueIds.has(sh.id)) continue;
+          // Día sin abono (sábado en bancos que abonan el lunes): todo lo generado queda acumulado.
+          const amount = payDate === null ? 0 : sh.amount;
+          const carry = payDate === null ? Math.round((sh.amount + sh.carry) * 1e6) / 1e6 : sh.carry;
           // Solo un proceso avanza el día de cada cuenta; si otro ya lo hizo, no se abona de nuevo.
           const upd = await client.query(
             `UPDATE accounts SET yield_accrued_until = $2::date, yield_carry = $3
               WHERE id = $1 AND (yield_accrued_until IS NULL OR yield_accrued_until < $2::date)
               RETURNING id`,
-            [sh.id, d, sh.carry],
+            [sh.id, d, carry],
           );
           if (!upd.rowCount) continue;
-          carries.set(sh.id, sh.carry);
-          if (sh.amount >= 0.01) {
+          carries.set(sh.id, carry);
+          if (payDate !== null && amount >= 0.01) {
+            // Un abono por cuenta y fecha: si ya existe (el del fin de semana creado el lunes), se le suma.
+            // El UPDATE de arriba garantiza que cada día se procese una sola vez, así que sumar no duplica.
             const ins = await client.query(
               `INSERT INTO balance_adjustments (account_id, amount, date, note, source, auto)
-               VALUES ($1, $2, $3, 'Rendimiento del día', 'rendimiento', true)
-               ON CONFLICT (account_id, date) WHERE auto DO NOTHING`,
-              [sh.id, sh.amount, d],
+               VALUES ($1, $2, $3, $4, 'rendimiento', true)
+               ON CONFLICT (account_id, date) WHERE auto DO UPDATE
+                 SET amount = balance_adjustments.amount + EXCLUDED.amount,
+                     note = CASE WHEN balance_adjustments.note = $5 THEN $6 ELSE balance_adjustments.note END
+               RETURNING (xmax = 0) AS inserted`,
+              [sh.id, amount, payDate, payDate === d ? AUTO_YIELD_NOTE : AUTO_YIELD_NOTE_WEEKEND, AUTO_YIELD_NOTE_WEEKEND, AUTO_YIELD_NOTE_WEEKEND_MONDAY],
             );
-            created += ins.rowCount ?? 0;
+            created += ins.rows.filter((r: { inserted: boolean }) => r.inserted).length;
           }
         }
       }

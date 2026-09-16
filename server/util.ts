@@ -103,7 +103,17 @@ export function round2(n: number): number {
 }
 
 /** Middleware final de errores: JSON consistente y log en servidor. */
-export function errorHandler(err: unknown, _req: Request, res: Response, _next: NextFunction): void {
+export function errorHandler(err: unknown, req: Request, res: Response, _next: NextFunction): void {
+  // La API rápida (Atajos de iPhone) muestra "message" en la notificación: se agrega a cualquier error de /api/quick.
+  if (req.originalUrl?.startsWith('/api/quick')) {
+    const json = res.json.bind(res);
+    res.json = (body: unknown) => {
+      if (body && typeof body === 'object' && 'error' in body && !('message' in body)) {
+        return json({ ok: false, message: String((body as { error: unknown }).error), ...(body as object) });
+      }
+      return json(body);
+    };
+  }
   if (err instanceof HttpError) {
     res.status(err.status).json({ error: err.message, details: err.details });
     return;

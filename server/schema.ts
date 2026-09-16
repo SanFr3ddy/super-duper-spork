@@ -121,6 +121,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_banks_name_ci ON banks (lower(name));
 -- Rendimiento automático diario (server/yieldAccrual.ts)
 ALTER TABLE banks ADD COLUMN IF NOT EXISTS auto_yield BOOLEAN NOT NULL DEFAULT true;
 ALTER TABLE banks ADD COLUMN IF NOT EXISTS rate_since DATE;
+-- Bancos que no abonan en fin de semana (p. ej. DiDi): lo del sábado y domingo se abona el lunes
+ALTER TABLE banks ADD COLUMN IF NOT EXISTS weekend_on_monday BOOLEAN NOT NULL DEFAULT false;
 UPDATE banks SET rate_since = (created_at AT TIME ZONE 'America/Mexico_City')::date WHERE rate_since IS NULL;
 
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS bank_id INT REFERENCES banks(id) ON DELETE SET NULL;
